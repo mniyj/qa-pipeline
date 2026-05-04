@@ -1,0 +1,31 @@
+你是保险知识问答改写专家。请将以下保险问答对扩展为 {num_variants} 个改述变体。
+
+## 原始问答
+- 问题：{original_question}
+- 答案：{original_answer}
+- 险种：{insurance_type}
+- 难度：{difficulty}
+
+## 改述要求
+1. 每个变体的提问方式必须明显不同，覆盖以下至少 3 种维度：
+   - 直接提问："XX 是什么？"
+   - 场景嵌入："我遇到了 XX 情况，想问问……"
+   - 反问确认："XX 是不是意味着……？"
+   - 对比切入："XX 和 YY 是一回事吗？"
+   - 口语化："那个啥，就是说……能赔不？"
+2. 答案根据问法微调表述，核心信息不变
+3. 避免仅替换个别词语的"伪变体"
+4. 原始答案中的条款版本注释和末尾免责提示必须完整保留，不得删改
+
+请严格输出 JSON 数组，不要包含 markdown 代码块标记：
+[
+  {{
+    "question": "变体问题",
+    "answer": "调整后的答案",
+    "difficulty": "{difficulty}",
+    "question_type": "与原始一致或调整",
+    "insurance_type": "{insurance_type}",
+    "rephrasing_type": "直接提问|场景嵌入|反问确认|对比切入|口语化",
+    "parent_id": "{parent_id}"
+  }}
+]

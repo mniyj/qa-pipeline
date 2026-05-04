@@ -1,0 +1,153 @@
+# ============================================================
+# 保险知识问答生成管道 - 项目配置
+# ============================================================
+
+project:
+  name: insurance-qa-pipeline
+  target_total: 100000
+  output_format: jsonl  # 每行一条 Q&A，便于流式处理
+
+# ---------- 知识骨架定义 ----------
+# 只配置你们实际业务覆盖的范围，不需要全量
+knowledge_schema:
+  insurance_types:
+    人身险:
+      - 百万医疗险
+      - 小额医疗险
+      - 重疾险
+      - 防癌险
+      - 惠民保
+      - 长期护理险
+      - 定期寿险
+      - 终身寿险
+      - 增额终身寿
+      - 年金险
+      - 综合意外险
+      - 旅游意外险
+    财产险:
+      - 交强险
+      - 车损险
+      - 第三者责任险
+      - 车上人员责任险
+      - 新能源车险
+      - 企业财产险
+      - 雇主责任险
+      - 公众责任险
+
+  business_stages:
+    - 产品设计
+    - 精算定价
+    - 销售展业
+    - 投保告知
+    - 核保
+    - 承保出单
+    - 保全变更
+    - 续保续费
+    - 报案
+    - 查勘定损
+    - 理赔审核
+    - 赔付结案
+
+  user_roles:
+    - 投保人/被保人
+    - 保险代理人
+    - 核保师
+    - 理赔员
+
+  question_types:
+    - 概念解释
+    - 流程指引
+    - 条款解读
+    - 边界判断
+    - 计算说明
+    - 对比区分
+    - 案例分析
+    - 注意事项
+
+# ---------- 文档预处理配置 ----------
+preprocessing:
+  chunk_size: 1200          # 每个 chunk 的目标字数
+  chunk_overlap: 200        # chunk 之间的重叠字数
+  min_chunk_size: 300       # 低于此长度的 chunk 会合并到上一个
+  supported_formats:
+    - .pdf
+    - .docx
+    - .txt
+    - .md
+
+# ---------- 模型配置 ----------
+# 种子生成用高质量模型，扩展和质检用低成本模型
+models:
+  seed_generation:
+    provider: deepseek
+    model: deepseek-chat
+    max_tokens: 4096
+    temperature: 0.7
+
+  expansion:
+    provider: deepseek
+    model: deepseek-chat
+    max_tokens: 4096
+    temperature: 0.8
+
+  quality_check:
+    provider: deepseek
+    model: deepseek-chat
+    max_tokens: 2048
+    temperature: 0.3          # 质检需要更确定性的输出
+
+  embedding:
+    provider: dashscope
+    model: text-embedding-v3  # 通义千问 embedding
+    dimension: 1024
+
+# ---------- API 密钥 ----------
+# 实际使用时从环境变量读取，这里只做占位
+api_keys:
+  anthropic: ${ANTHROPIC_API_KEY}
+  dashscope: ${DASHSCOPE_API_KEY}
+  openai: ${OPENAI_API_KEY}
+
+# ---------- 存储配置 ----------
+storage:
+  # Milvus 向量数据库（用于去重和检索）
+  milvus:
+    host: localhost
+    port: 19530
+    collection: insurance_qa
+    dedup_threshold: 0.92     # cosine > 此值视为重复
+
+  # 输出目录
+  paths:
+    raw_documents: ./data/raw_documents
+    chunks: ./data/chunks
+    seeds: ./data/seeds
+    expanded: ./data/expanded
+    qc_results: ./data/qc_results
+    final: ./data/final
+
+# ---------- 生成配置 ----------
+generation:
+  seed:
+    pairs_per_chunk: 8              # 每个 chunk 生成几条种子 Q&A
+    batch_size: 10                  # 每批处理多少个 chunk
+    concurrency: 3                  # 并发调用数
+
+  expansion:
+    rephrase_variants: 5            # 每条种子的改述变体数
+    scenario_transfer_targets: 4    # 场景迁移的目标场景数
+    follow_up_depth: 4              # 追问链深度
+    template_batch_size: 50         # 模板批量生成的每批数量
+    concurrency: 5
+
+# ---------- 质检配置 ----------
+quality_check:
+  format_validation: true
+  semantic_dedup: true
+  fact_check: true
+  consistency_check: true
+  coverage_analysis: true
+  human_sample_rate: 0.05           # 5% 人工抽检
+  min_answer_length: 30
+  max_answer_length: 2000
+  min_question_length: 10

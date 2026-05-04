@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Insurance QA Pipeline</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <style>
+    [v-cloak] { display: none; }
+    .line-clamp-2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  </style>
+</head>
+<body class="bg-gray-50 text-gray-800 text-sm">
+
+<div id="app" v-cloak>
+  <!-- Header -->
+  <header class="bg-white border-b px-6 py-3 flex items-center justify-between sticky top-0 z-20 shadow-sm">
+    <div class="flex items-center gap-3">
+      <span class="text-blue-600 font-bold text-base">⚡ Insurance QA Pipeline</span>
+    </div>
+    <div class="flex items-center gap-2 text-xs text-gray-500">
+      <span v-if="pipelineStatus.is_running"
+            class="inline-block w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin"></span>
+      <span v-else class="inline-block w-2.5 h-2.5 rounded-full bg-green-400"></span>
+      {{ pipelineStatus.is_running ? '运行中…' : '就绪' }}
+    </div>
+  </header>
+
+  <div class="flex min-h-screen">
+    <!-- Sidebar -->
+    <nav class="w-44 bg-white border-r pt-4 px-2 flex flex-col gap-0.5 flex-shrink-0">
+      <button v-for="item in navItems" :key="item.key"
+              @click="currentPage = item.key"
+              :class="['w-full text-left px-3 py-2 rounded-lg font-medium transition-colors',
+                       currentPage === item.key
+                         ? 'bg-blue-50 text-blue-700'
+                         : 'text-gray-600 hover:bg-gray-100']">
+        <span class="mr-1.5">{{ item.icon }}</span>{{ item.label }}
+      </button>
+    </nav>
+
+    <!-- Main -->
+    <main class="flex-1 p-6 overflow-auto min-w-0">
+      <component :is="pages[currentPage]" :pipeline-status="pipelineStatus" />
+    </main>
+  </div>
+</div>
+
+<script>
+const { createApp, ref, reactive, onMounted, onUnmounted, nextTick, computed, watch } = Vue;
+
+// ─── Page: Documents ──────────────────────────────────────────────────────────
+const PageDocuments = {
+  template: `
+    <div>
+      <h2 class="text-base font-semibold mb-4">文档管理</h2>
+
+      <div @dragover.prevent @drop.prevent="onDrop"
+           @click="$refs.fi.click()"
+           class="border-2 border-dashed border-blue-200 rounded-xl p-10 text-center cursor-pointer hover:bg-blue-50 hover:border-blue-400 transition mb-5">
+        <div class="text-3xl mb-2">📄</div>
+        <p class="text-blue-500 font-medium">点击或拖拽文件上传</p>
+        <p class="text-gray-400 text-xs mt-1">支持 PDF / DOCX / TXT / MD</p>
+        <input ref="fi" type="file" multiple accept=".pdf,.docx,.doc,.txt,.md" class="hidden" @change="onSelect" />
+      </div>
+
+      <div v-if="uploading" class="mb-3 flex items-center gap-2 text-blue-500 text-xs">
+        <span class="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin"></span>
+        上传中…
+      </div>
+
+      <div v-if="files.length" class="bg-white border rounded-xl overflow-hidden mb-4">
+        <table class="w-full">
+          <thead class="bg-gray-50 text-gray-500 text-xs border-b">
+            <tr>
+              <th class="text-left px-4 py-2 font-medium">文件名</th>
+              <th class="text-left px-4 py-2 font-medium w-24">大小</th>
+              <th class="px-4 py-2 w-16"></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="f in files" :key="f.relative_path" class="border-b last:border-0 hover:bg-gray-50">
+              <td class="px-4 py-2.5 text-gray-700">{{ f.name }}</td>
+              <td class="px-4 py-2.5 text-gray-400 text-xs">{{ fmtSize(f.size) }}</td>
+              <td class="px-4 py-2.5 text-center">
+                <button @click.stop="del(f.relative_path)"
+                        class="text-red-300 hover:text-red-500 transition text-xs">删除</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p v-else class="text-gray-400 text-xs">暂无文档，请上传文件</p>
+
+      <button v-if="files.length" @click="startPreprocess"
+              class="mt-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium">
+        开始预处理 →
+      </button>
+    </div>
+  `,
+  setup() {
+    const files = ref([]);
+    const uploading = ref(false);
+
+    async function load() {
+      const r = await fetch('/api/documents/');
+      files.value = (await r.json()).files;
+    }
+
+    async function upload(list) {
+      uploading.value = true;
+      for (const f of list) {
+        const form = new FormData();
+        form.append('file', f);
+        await fetch('/api/documents/upload', { method: 'POST', body: form });
+      }
+      uploading.value = false;
+      load();
+    }
+
+    function onDrop(e) { upload(e.dataTransfer.files); }
+    function onSelect(e) { upload(e.target.files); }
+
+    async function del(path) {
+      if (!confirm('确认删除？')) return;
+      await fetch('/api/documents/' + path, { method: 'DELETE' });
+      load();
+    }
+
+    async function startPreprocess() {
+      await fetch('/api/pipeline/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ step: 'preprocess' }),
+      });
+      alert('预处理已启动，请前往「流水线」页面查看进度');
+    }
+
+    function fmtSize(b) {
+      if (b < 1024) return b + ' B';
+      if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+      return (b / 1048576).toFixed(1) + ' MB';
+    }
+
+    onMounted(load);
+    return { files, uploading, onDrop, onSelect, del, startPreprocess, fmtSize };
+  },
+};
+
+// ─── Page: Pipeline ───────────────────────────────────────────────────────────
+const PagePipeline = {
+  props: ['pipelineStatus'],
+  template: `
+    <div>
+      <h2 class="text-base font-semibold mb-5">流水线控制</h2>
+
+      <!-- Step cards -->
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+        <div v-for="(step, key) in localStatus.steps" :key="key"
+             class="bg-white border rounded-xl p-4 shadow-sm">
+          <div class="flex items-center gap-2 mb-2">
+            <span :class="dotClass(step.status)"></span>
+            <span class="font-medium">{{ step.label }}</span>
+          </div>
+          <div class="text-xs text-gray-400 mb-2">{{ statusText(step.status) }}</div>
+          <div v-if="step.status === 'running'" class="h-1 rounded bg-gray-100 overflow-hidden">
+            <div class="h-1 bg-blue-500 rounded animate-pulse" style="width:60%"></div>
+          </div>
+          <div v-if="step.output_count" class="text-xs text-green-600 mt-1">
+            输出 {{ step.output_count.toLocaleString() }} 条
+          </div>
+          <div v-if="step.error" class="text-xs text-red-400 mt-1 truncate" :title="step.error">
+            {{ step.error }}
+          </div>
+        </div>
+      </div>
+
+      <!-- Control buttons -->
+      <div class="flex flex-wrap gap-2 mb-5">
+        <button @click="start('all')" :disabled="localStatus.is_running"
+                class="px-4 py-1.5 bg-blue-600 text-white rounded-lg disabled:opacity-40 hover:bg-blue-700 transition font-medium">
+          ▶ 全流程
+        </button>
+        <button v-for="s in ['preprocess','seed','expand','qc']" :key="s"
+                @click="start(s)" :disabled="localStatus.is_running"
+                class="px-3 py-1.5 bg-white border rounded-lg text-gray-600 disabled:opacity-40 hover:bg-gray-50 transition">
+          {{ stepLabel(s) }}
+        </button>
+      </div>
+
+      <!-- Log console -->
+      <div class="bg-gray-900 rounded-xl px-4 py-3 font-mono text-xs text-green-300 h-64 overflow-y-auto" ref="logEl">
+        <div v-if="!logs.length" class="text-gray-600">等待日志输出…</div>
+        <div v-for="(line, i) in logs" :key="i"
+             :class="line.level === 'ERROR' ? 'text-red-400' : line.level === 'WARNING' ? 'text-yellow-300' : ''">
+          {{ line.message }}
+        </div>
+      </div>
+    </div>
+  `,
+  setup(props) {
+    const logs = ref([]);
+    const logEl = ref(null);
+    const localStatus = reactive({ is_running: false, steps: {} });
+    let es = null;
+
+    function syncStatus(state) {
+      if (state) Object.assign(localStatus, state);
+    }
+
+    function connect() {
+      if (es) es.close();
+      es = new EventSource('/api/pipeline/events');
+      es.onmessage = (e) => {
+        const ev = JSON.parse(e.data);
+        if (ev.type === 'init') syncStatus(ev.state);
+        else if (ev.type === 'step_update') {
+          localStatus.is_running = true;
+          if (localStatus.steps[ev.step]) Object.assign(localStatus.steps[ev.step], ev);
+        } else if (ev.type === 'log') {
+          logs.value.push(ev);
+          if (logs.value.length > 300) logs.value.shift();
+          nextTick(() => { if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight; });
+        }
+      };
+      es.onerror = () => setTimeout(connect, 3000);
+    }
+
+    watch(() => props.pipelineStatus, (v) => syncStatus(v), { deep: true });
+
+    async function start(step) {
+      logs.value = [];
+      const r = await fetch('/api/pipeline/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ step }),
+      });
+      if (!r.ok) {
+        const d = await r.json();
+        alert(d.detail || '启动失败');
+      }
+    }
+
+    function dotClass(s) {
+      return {
+        idle:    'w-2 h-2 rounded-full bg-gray-300',
+        running: 'w-2 h-2 rounded-full bg-blue-500 animate-pulse',
+        done:    'w-2 h-2 rounded-full bg-green-500',
+        error:   'w-2 h-2 rounded-full bg-red-500',
+      }[s] || 'w-2 h-2 rounded-full bg-gray-300';
+    }
+    function statusText(s) {
+      return { idle: '待运行', running: '运行中…', done: '已完成', error: '出错' }[s] || s;
+    }
+    function stepLabel(s) {
+      return { preprocess: '预处理', seed: '种子生成', expand: '批量扩展', qc: '质检' }[s] || s;
+    }
+
+    onMounted(connect);
+    onUnmounted(() => { if (es) es.close(); });
+    return { logs, logEl, localStatus, start, dotClass, statusText, stepLabel };
+  },
+};
+
+// ─── Page: Chunks ─────────────────────────────────────────────────────────────
+const PageChunks = {
+  template: `
+    <div>
+      <h2 class="text-base font-semibold mb-4">文档 Chunks</h2>
+
+      <div class="flex flex-wrap gap-2 mb-4">
+        <select v-model="f.doc_type" @change="load(1)" class="border rounded px-2 py-1.5 text-xs">
+          <option value="">文档类型: 全部</option>
+          <option v-for="t in opts.doc_types" :key="t" :value="t">{{ t }}</option>
+        </select>
+        <select v-model="f.insurance_type" @change="load(1)" class="border rounded px-2 py-1.5 text-xs">
+          <option value="">险种: 全部</option>
+          <option v-for="t in opts.ins_types" :key="t" :value="t">{{ t }}</option>
+        </select>
+        <input v-model="search" @keyup.enter="load(1)" placeholder="搜索内容…"
+               class="border rounded px-3 py-1.5 text-xs flex-1 min-w-40" />
+        <button @click="load(1)" class="px-3 py-1.5 bg-blue-600 text-white rounded text-xs hover:bg-blue-700 transition">搜索</button>
+      </div>
+
+      <div class="text-xs text-gray-400 mb-3">共 {{ result.total.toLocaleString() }} 条</div>
+
+      <div v-if="loading" class="text-center py-10 text-gray-400">加载中…</div>
+
+      <div v-else class="space-y-2">
+        <div v-for="(c, i) in result.items" :key="c.chunk_id || i"
+             @click="expanded = expanded === i ? null : i"
+             class="bg-white border rounded-lg p-3 cursor-pointer hover:border-blue-300 transition">
+          <div class="flex justify-between items-start mb-1">
+            <div class="flex items-center gap-2 flex-wrap">
+              <span class="text-gray-400 font-mono text-xs">{{ c.chunk_id }}</span>
+              <span class="px-1.5 py-0.5 bg-blue-50 text-blue-600 rounded text-xs">{{ c.doc_type }}</span>
+              <span v-if="c.insurance_type && c.insurance_type !== '通用'"
+                    class="px-1.5 py-0.5 bg-green-50 text-green-600 rounded text-xs">{{ c.insurance_type }}</span>
+              <span v-if="c.section_title" class="text-gray-400 text-xs">{{ c.section_title }}</span>
+            </div>
+            <span class="text-gray-300 text-xs whitespace-nowrap ml-2">{{ c.char_count }} 字</span>
+          </div>
+          <p class="text-gray-600 text-xs line-clamp-2">{{ c.text }}</p>
+          <div v-if="expanded === i" class="mt-3 text-xs text-gray-700 whitespace-pre-wrap border-t pt-3 leading-relaxed">{{ c.text }}</div>
+        </div>
+        <div v-if="!result.items.length" class="text-center py-10 text-gray-400">无数据</div>
+      </div>
+
+      <!-- Pagination -->
+      <div class="flex items-center gap-2 mt-4 text-xs">
+        <button @click="load(result.page-1)" :disabled="result.page<=1"
+                class="px-3 py-1.5 border rounded disabled:opacity-30 hover:bg-gray-50 transition">‹ 上一页</button>
+        <span class="text-gray-500">第 {{ result.page }} / {{ result.pages }} 页</span>
+        <button @click="load(result.page+1)" :disabled="result.page>=result.pages"
+                class="px-3 py-1.5 border rounded disabled:opacity-30 hover:bg-gray-50 transition">下一页 ›</button>
+      </div>
+    </div>
+  `,
+  setup() {
+    const f = reactive({ doc_type: '', insurance_type: '' });
+    const search = ref('');
+    const expanded = ref(null);
+    const loading = ref(false);
+    const result = reactive({ items: [], total: 0, page: 1, pages: 1 });
+    const opts = reactive({ doc_types: [], ins_types: [] });
+
+    async function load(page = 1) {
+      loading.value = true; expanded.value = null;
+      const p = new URLSearchParams({ page, size: 20, doc_type: f.doc_type, insurance_type: f.insurance_type, search: search.value });
+      const r = await fetch('/api/data/chunks?' + p);
+      Object.assign(result, await r.json());
+      if (!opts.doc_types.length && result.items.length) {
+        opts.doc_types = [...new Set(result.items.map(c => c.doc_type).filter(Boolean))];
+        opts.ins_types = [...new Set(result.items.map(c => c.insurance_type).filter(Boolean))];
+      }
+      loading.value = false;
+    }
+
+    onMounted(() => load(1));
+    return { f, search, expanded, loading, result, opts, load };
+  },
+};
+
+// ─── Page: Q&A Browser ────────────────────────────────────────────────────────
+const PageQA = {
+  template: `
+    <div>
+      <h2 class="text-base font-semibold mb-4">Q&A 浏览器</h2>
+
+      <!-- Filters -->
+      <div class="bg-white border rounded-xl p-4 mb-4 flex flex-wrap gap-3 items-end">
+        <div v-for="(opts, key) in filterOpts" :key="key" class="flex flex-col gap-1">
+          <label class="text-xs text-gray-400">{{ filterLabel(key) }}</label>
+          <select v-model="filters[key]" @change="loadPage(1)"
+                  class="border rounded px-2 py-1.5 text-xs min-w-28 bg-white">
+            <option value="">全部</option>
+            <option v-for="o in opts" :key="o" :value="o">{{ o }}</option>
+          </select>
+        </div>
+        <div class="flex flex-col gap-1">
+          <label class="text-xs text-gray-400">状态</label>
+          <select v-model="filters.status" @change="loadPage(1)"
+                  class="border rounded px-2 py-1.5 text-xs bg-white">
+            <option value="passed">质检通过</option>
+            <option value="rejected">质检拒绝</option>
+          </select>
+        </div>
+        <div class="flex flex-col gap-1 flex-1 min-w-40">
+          <label class="text-xs text-gray-400">搜索问题</label>
+          <input v-model="searchText" @keyup.enter="loadPage(1)" type="text"
+                 placeholder="输入关键词后回车…" class="border rounded px-3 py-1.5 text-xs" />
+        </div>
+        <div class="flex flex-col gap-1">
+          <label class="text-xs text-gray-400">每页</label>
+          <select v-model.number="pageSize" @change="loadPage(1)"
+                  class="border rounded px-2 py-1.5 text-xs bg-white">
+            <option :value="20">20</option>
+            <option :value="50">50</option>
+            <option :value="100">100</option>
+          </select>
+        </div>
+        <button @click="reset" class="text-xs text-gray-400 hover:text-gray-600 underline self-end pb-1.5">重置</button>
+      </div>
+
+      <!-- Count -->
+      <div class="flex justify-between items-center mb-2">
+        <span class="text-xs text-gray-400">
+          共 <strong class="text-gray-700">{{ result.total.toLocaleString() }}</strong> 条 &nbsp;·&nbsp;
+          显示第 {{ ((result.page-1)*result.size+1).toLocaleString() }}–{{ Math.min(result.page*result.size, result.total).toLocaleString() }} 条
+        </span>
+      </div>
+
+      <!-- Table -->
+      <div class="bg-white border rounded-xl overflow-hidden mb-3">
+        <table class="w-full">
+          <thead class="bg-gray-50 text-gray-400 text-xs border-b">
+            <tr>
+              <th class="text-left px-4 py-2 font-medium">问题</th>
+              <th class="text-left px-4 py-2 font-medium w-24">险种</th>
+              <th class="text-left px-4 py-2 font-medium w-16">难度</th>
+              <th class="text-left px-4 py-2 font-medium w-24 hidden md:table-cell">类型</th>
+              <th class="text-left px-4 py-2 font-medium w-20 hidden md:table-cell">来源</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template v-for="(item, i) in result.items" :key="item.id || i">
+              <tr @click="toggle(i)"
+                  class="border-b cursor-pointer hover:bg-blue-50 transition">
+                <td class="px-4 py-2.5 text-gray-700">{{ trunc(item.question, 90) }}</td>
+                <td class="px-4 py-2.5 text-gray-400 text-xs">{{ item.insurance_type || '—' }}</td>
+                <td class="px-4 py-2.5">
+                  <span :class="diffBadge(item.difficulty)">{{ item.difficulty || '—' }}</span>
+                </td>
+                <td class="px-4 py-2.5 text-gray-400 text-xs hidden md:table-cell">{{ item.question_type || '—' }}</td>
+                <td class="px-4 py-2.5 text-gray-300 text-xs hidden md:table-cell">{{ shortMethod(item.generation_method) }}</td>
+              </tr>
+              <!-- Expanded row -->
+              <tr v-if="expanded === i">
+                <td colspan="5" class="px-6 py-4 bg-blue-50 border-b">
+                  <p class="font-medium text-blue-800 mb-2">{{ item.question }}</p>
+                  <p class="text-gray-700 whitespace-pre-wrap leading-relaxed mb-3">{{ item.answer }}</p>
+                  <div v-if="item.tags && item.tags.length" class="flex flex-wrap gap-1 mb-2">
+                    <span v-for="t in item.tags" :key="t"
+                          class="px-2 py-0.5 bg-blue-100 text-blue-700 rounded text-xs">{{ t }}</span>
+                  </div>
+                  <div class="text-xs text-gray-400">
+                    来源文档: {{ item.source_doc || '—' }} &nbsp;·&nbsp;
+                    批次: {{ item.batch_id || '—' }} &nbsp;·&nbsp;
+                    方式: {{ item.generation_method || '—' }}
+                  </div>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+        <div v-if="loading" class="text-center py-8 text-gray-400">加载中…</div>
+        <div v-if="!loading && !result.items.length" class="text-center py-10 text-gray-400">无数据</div>
+      </div>
+
+      <!-- Pagination -->
+      <div class="flex items-center gap-1.5 text-xs flex-wrap">
+        <button @click="loadPage(1)" :disabled="result.page<=1"
+                class="px-2 py-1.5 border rounded disabled:opacity-30 hover:bg-gray-50 transition">«</button>
+        <button @click="loadPage(result.page-1)" :disabled="result.page<=1"
+                class="px-3 py-1.5 border rounded disabled:opacity-30 hover:bg-gray-50 transition">‹ 上一页</button>
+        <span class="px-2 text-gray-500">
+          第
+          <input type="number" v-model.number="jumpTo" @keyup.enter="loadPage(jumpTo)"
+                 class="w-12 border rounded px-1 py-0.5 text-center mx-1" :min="1" :max="result.pages" />
+          / {{ result.pages }} 页
+        </span>
+        <button @click="loadPage(result.page+1)" :disabled="result.page>=result.pages"
+                class="px-3 py-1.5 border rounded disabled:opacity-30 hover:bg-gray-50 transition">下一页 ›</button>
+        <button @click="loadPage(result.pages)" :disabled="result.page>=result.pages"
+                class="px-2 py-1.5 border rounded disabled:opacity-30 hover:bg-gray-50 transition">»</button>
+      </div>
+    </div>
+  `,
+  setup() {
+    const filters = reactive({ status: 'passed', insurance_type: '', difficulty: '', question_type: '', generation_method: '' });
+    const searchText = ref('');
+    const pageSize   = ref(20);
+    const jumpTo     = ref(1);
+    const expanded   = ref(null);
+    const loading    = ref(false);
+    const filterOpts = ref({ insurance_type: [], difficulty: [], question_type: [], generation_method: [] });
+    const result     = reactive({ items: [], total: 0, page: 1, size: 20, pages: 1 });
+
+    async function loadFilterOpts() {
+      const r = await fetch('/api/data/qa/filters');
+      const d = await r.json();
+      filterOpts.value = {
+        insurance_type:    d.insurance_types,
+        difficulty:        d.difficulties,
+        question_type:     d.question_types,
+        generation_method: d.generation_methods,
+      };
+    }
+
+    async function loadPage(page = 1) {
+      loading.value = true; expanded.value = null;
+      const p = new URLSearchParams({
+        page, size: pageSize.value,
+        status:            filters.status,
+        insurance_type:    filters.insurance_type,
+        difficulty:        filters.difficulty,
+        question_type:     filters.question_type,
+        generation_method: filters.generation_method,
+        search:            searchText.value,
+      });
+      const r = await fetch('/api/data/qa?' + p);
+      Object.assign(result, await r.json());
+      jumpTo.value  = result.page;
+      loading.value = false;
+    }
+
+    function toggle(i)  { expanded.value = expanded.value === i ? null : i; }
+    function trunc(s, n) { return s && s.length > n ? s.slice(0, n) + '…' : (s || ''); }
+    function reset() {
+      Object.assign(filters, { status: 'passed', insurance_type: '', difficulty: '', question_type: '', generation_method: '' });
+      searchText.value = ''; loadPage(1);
+    }
+    function diffBadge(d) {
+      return {
+        '入门': 'px-1.5 py-0.5 rounded text-xs bg-green-50 text-green-600',
+        '进阶': 'px-1.5 py-0.5 rounded text-xs bg-yellow-50 text-yellow-600',
+        '专业': 'px-1.5 py-0.5 rounded text-xs bg-red-50 text-red-600',
+      }[d] || 'text-xs text-gray-400';
+    }
+    function filterLabel(k) {
+      return { insurance_type: '险种', difficulty: '难度', question_type: '问题类型', generation_method: '生成方式' }[k] || k;
+    }
+    function shortMethod(m) {
+      return { seed_from_document: '种子', rephrase: '改述', followup: '追问' }[m] || (m || '—');
+    }
+
+    onMounted(() => { loadFilterOpts(); loadPage(1); });
+    return { filters, searchText, pageSize, jumpTo, expanded, loading, filterOpts, result, loadPage, toggle, trunc, reset, diffBadge, filterLabel, shortMethod };
+  },
+};
+
+// ─── Page: Reports ────────────────────────────────────────────────────────────
+const PageReports = {
+  template: `
+    <div>
+      <h2 class="text-base font-semibold mb-4">数据报告</h2>
+
+      <!-- Summary cards -->
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-7">
+        <div class="bg-white border rounded-xl p-4 text-center shadow-sm">
+          <div class="text-2xl font-bold text-blue-600">{{ n(ov.preprocessing?.total_chunks) }}</div>
+          <div class="text-xs text-gray-400 mt-1">Chunks</div>
+        </div>
+        <div class="bg-white border rounded-xl p-4 text-center shadow-sm">
+          <div class="text-2xl font-bold text-purple-500">{{ n(ov.seeds_total) }}</div>
+          <div class="text-xs text-gray-400 mt-1">种子 Q&A</div>
+        </div>
+        <div class="bg-white border rounded-xl p-4 text-center shadow-sm">
+          <div class="text-2xl font-bold text-yellow-500">{{ n(ov.expanded_total) }}</div>
+          <div class="text-xs text-gray-400 mt-1">扩展 Q&A</div>
+        </div>
+        <div class="bg-white border rounded-xl p-4 text-center shadow-sm">
+          <div class="text-2xl font-bold text-green-600">{{ n(ov.qc?.passed_total) }}</div>
+          <div class="text-xs text-gray-400 mt-1">质检通过</div>
+        </div>
+      </div>
+
+      <!-- Charts -->
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-5 mb-6">
+        <div class="bg-white border rounded-xl p-4 shadow-sm">
+          <h3 class="text-xs font-medium text-gray-500 mb-3">险种分布（前10）</h3>
+          <canvas ref="insChartEl" height="260"></canvas>
+        </div>
+        <div class="bg-white border rounded-xl p-4 shadow-sm">
+          <h3 class="text-xs font-medium text-gray-500 mb-3">难度分布</h3>
+          <canvas ref="diffChartEl" height="260"></canvas>
+        </div>
+      </div>
+
+      <!-- QC rejection reasons -->
+      <div v-if="rejections.length" class="bg-white border rounded-xl p-4 shadow-sm">
+        <h3 class="text-xs font-medium text-gray-500 mb-3">质检拒绝原因</h3>
+        <div class="space-y-1.5">
+          <div v-for="r in rejections" :key="r.reason" class="flex justify-between text-xs border-b pb-1.5 last:border-0">
+            <span class="text-gray-700">{{ r.reason }}</span>
+            <span class="text-gray-400 font-mono">{{ r.count }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  `,
+  setup() {
+    const ov = ref({});
+    const rejections = ref([]);
+    const insChartEl = ref(null);
+    const diffChartEl = ref(null);
+    let insChart = null, diffChart = null;
+
+    function n(v) { return (v || 0).toLocaleString(); }
+
+    async function load() {
+      const r = await fetch('/api/data/reports/overview');
+      ov.value = await r.json();
+
+      const reasons = ov.value.qc?.rejection_reasons || {};
+      rejections.value = Object.entries(reasons)
+        .map(([reason, count]) => ({ reason, count }))
+        .sort((a, b) => b.count - a.count);
+
+      nextTick(renderCharts);
+    }
+
+    function renderCharts() {
+      const insDist  = ov.value.qc?.insurance_type_distribution || {};
+      const diffDist = ov.value.qc?.difficulty_distribution || {};
+
+      if (insChartEl.value) {
+        if (insChart) insChart.destroy();
+        const entries = Object.entries(insDist).sort((a, b) => b[1] - a[1]).slice(0, 10);
+        insChart = new Chart(insChartEl.value, {
+          type: 'bar',
+          data: {
+            labels: entries.map(e => e[0]),
+            datasets: [{ data: entries.map(e => e[1]), backgroundColor: '#3b82f6', borderRadius: 4 }],
+          },
+          options: {
+            indexAxis: 'y',
+            plugins: { legend: { display: false } },
+            scales: { x: { grid: { display: false } }, y: { grid: { display: false } } },
+          },
+        });
+      }
+
+      if (diffChartEl.value && Object.keys(diffDist).length) {
+        if (diffChart) diffChart.destroy();
+        diffChart = new Chart(diffChartEl.value, {
+          type: 'doughnut',
+          data: {
+            labels: Object.keys(diffDist),
+            datasets: [{ data: Object.values(diffDist), backgroundColor: ['#22c55e', '#eab308', '#ef4444'], borderWidth: 0 }],
+          },
+          options: { plugins: { legend: { position: 'bottom' } }, cutout: '65%' },
+        });
+      }
+    }
+
+    onMounted(load);
+    return { ov, rejections, insChartEl, diffChartEl, n };
+  },
+};
+
+// ─── Root App ─────────────────────────────────────────────────────────────────
+const navItems = [
+  { key: 'documents', label: '文档上传', icon: '📁' },
+  { key: 'pipeline',  label: '流水线',   icon: '⚙️'  },
+  { key: 'chunks',    label: 'Chunks',   icon: '📦' },
+  { key: 'qa',        label: 'Q&A 浏览', icon: '💬' },
+  { key: 'reports',   label: '数据报告', icon: '📊' },
+];
+const pages = {
+  documents: PageDocuments,
+  pipeline:  PagePipeline,
+  chunks:    PageChunks,
+  qa:        PageQA,
+  reports:   PageReports,
+};
+
+createApp({
+  setup() {
+    const currentPage   = ref('documents');
+    const pipelineStatus = reactive({ is_running: false, steps: {} });
+
+    let es = null;
+    let pollTimer = null;
+
+    async function pollStatus() {
+      try {
+        const r = await fetch('/api/pipeline/status');
+        Object.assign(pipelineStatus, await r.json());
+      } catch {}
+    }
+
+    function connectSSE() {
+      if (es) es.close();
+      es = new EventSource('/api/pipeline/events');
+      es.onmessage = (e) => {
+        const ev = JSON.parse(e.data);
+        if (ev.type === 'init') Object.assign(pipelineStatus, ev.state);
+        else if (ev.type === 'step_update') pipelineStatus.is_running = true;
+      };
+      es.onerror = () => setTimeout(connectSSE, 5000);
+    }
+
+    onMounted(() => {
+      connectSSE();
+      pollStatus();
+      pollTimer = setInterval(pollStatus, 5000);
+    });
+    onUnmounted(() => {
+      if (es) es.close();
+      clearInterval(pollTimer);
+    });
+
+    return { currentPage, navItems, pages, pipelineStatus };
+  },
+  template: `
+    <div>
+      <header class="bg-white border-b px-6 py-3 flex items-center justify-between sticky top-0 z-20 shadow-sm">
+        <span class="text-blue-600 font-bold text-base">⚡ Insurance QA Pipeline</span>
+        <div class="flex items-center gap-2 text-xs text-gray-500">
+          <span v-if="pipelineStatus.is_running"
+                class="inline-block w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin"></span>
+          <span v-else class="inline-block w-2.5 h-2.5 rounded-full bg-green-400"></span>
+          {{ pipelineStatus.is_running ? '运行中…' : '就绪' }}
+        </div>
+      </header>
+      <div class="flex min-h-screen">
+        <nav class="w-44 bg-white border-r pt-4 px-2 flex flex-col gap-0.5 flex-shrink-0">
+          <button v-for="item in navItems" :key="item.key"
+                  @click="currentPage = item.key"
+                  :class="['w-full text-left px-3 py-2 rounded-lg text-sm font-medium transition-colors',
+                           currentPage === item.key ? 'bg-blue-50 text-blue-700' : 'text-gray-600 hover:bg-gray-100']">
+            <span class="mr-1.5">{{ item.icon }}</span>{{ item.label }}
+          </button>
+        </nav>
+        <main class="flex-1 p-6 overflow-auto min-w-0">
+          <component :is="pages[currentPage]" :pipeline-status="pipelineStatus" />
+        </main>
+      </div>
+    </div>
+  `,
+}).mount('#app');
+</script>
+</body>
+</html>

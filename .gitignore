@@ -1,0 +1,16 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+data/raw_documents/*
+!data/raw_documents/.gitkeep
+data/chunks/*
+!data/chunks/.gitkeep
+data/seeds/*
+!data/seeds/sample_seeds.jsonl
+data/expanded/*
+!data/expanded/.gitkeep
+data/qc_results/*
+!data/qc_results/.gitkeep
+data/final/*
+!data/final/.gitkeep
