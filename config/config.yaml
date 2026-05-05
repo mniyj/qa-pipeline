@@ -131,7 +131,7 @@ generation:
   seed:
     pairs_per_chunk: 8              # 每个 chunk 生成几条种子 Q&A
     batch_size: 10                  # 每批处理多少个 chunk
-    concurrency: 3                  # 并发调用数
+    concurrency: 20                 # 并发调用数
 
   expansion:
     rephrase_variants: 5            # 每条种子的改述变体数

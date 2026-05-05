@@ -154,13 +154,16 @@ async def _generate_seeds_async(
                 f"[{i+1}/{len(chunks)}] 处理 chunk: {chunk['chunk_id']} "
                 f"({chunk['doc_type']} / {chunk['insurance_type']})"
             )
+            # 在文档内容前注入产品名，确保 LLM 生成产品专属问题
+            doc_file = chunk.get("doc_file", "")
+            product_header = f"【来源产品：{doc_file}】\n\n" if doc_file else ""
             prompt = prompt_template.format(
                 num_pairs=pairs_per_chunk,
                 doc_type=chunk["doc_type"],
                 insurance_type=chunk["insurance_type"],
                 section_title=chunk.get("section_title", ""),
-                doc_file=chunk.get("doc_file", ""),
-                document_content=chunk["text"],
+                doc_file=doc_file,
+                document_content=product_header + chunk["text"],
             )
             try:
                 response = await client.acall(prompt)

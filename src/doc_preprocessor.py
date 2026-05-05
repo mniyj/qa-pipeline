@@ -454,8 +454,27 @@ def process_all_documents(
             logger.error(f"处理失败: {file_path}, 错误: {e}")
             failed_files.append({"file": str(file_path), "error": str(e)})
 
-    # 追加新 chunks（不覆盖旧数据）
+    # 追加新 chunks，跳过 chunk_id 已存在的（防止同一文件被 preprocess 重复写入）
     chunks_file = output_path / "chunks.jsonl"
+    seen_chunk_ids: set[str] = set()
+    if chunks_file.exists():
+        with open(chunks_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    seen_chunk_ids.add(json.loads(line)["chunk_id"])
+
+    deduped_chunks, skipped = [], 0
+    for chunk in all_chunks:
+        if chunk["chunk_id"] in seen_chunk_ids:
+            skipped += 1
+        else:
+            seen_chunk_ids.add(chunk["chunk_id"])
+            deduped_chunks.append(chunk)
+
+    if skipped:
+        logger.info(f"跳过重复 chunk（同文件已处理）: {skipped} 个")
+    all_chunks = deduped_chunks
+
     with open(chunks_file, "a", encoding="utf-8") as f:
         for chunk in all_chunks:
             f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
