@@ -4,6 +4,8 @@ __pycache__/
 *.pyo
 data/raw_documents/*
 !data/raw_documents/.gitkeep
+!data/raw_documents/保险相关文件/
+!data/raw_documents/保险相关文件/*
 data/chunks/*
 !data/chunks/.gitkeep
 data/seeds/*
