@@ -19,17 +19,44 @@ import re
 import asyncio
 import argparse
 import logging
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
 import yaml
 from llm_client import create_client, usage_stats
+from dedup import DedupTracker
 
+_stop_event: threading.Event | None = None
+
+
+def _check_stop() -> bool:
+    global _stop_event
+    if _stop_event is None:
+        try:
+            from src.pipeline_state import pipeline_state
+            _stop_event = pipeline_state._cancel_event
+        except Exception:
+            return False
+    return _stop_event.is_set()
 
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+_DIFFICULTY_NORMALIZE = {"入门级": "入门", "进阶级": "进阶", "专业级": "专业"}
+
+
+def _normalize_qa(qa: dict) -> dict:
+    diff = qa.get("difficulty", "")
+    if diff in _DIFFICULTY_NORMALIZE:
+        qa["difficulty"] = _DIFFICULTY_NORMALIZE[diff]
+    return qa
+
+
+def _is_valid_qa(qa: dict) -> bool:
+    return bool(qa.get("question")) and len(qa.get("answer", "")) >= 20
 
 
 def _safe_format(template: str, **kwargs) -> str:
@@ -129,9 +156,10 @@ def expand_rephrase(
     output_dir: str,
     num_variants: int = 5,
     limit: Optional[int] = None,
+    progress_callback=None,
 ) -> list[dict]:
     """对每条种子生成改述变体（并发）"""
-    return asyncio.run(_expand_rephrase_async(seeds, config, output_dir, num_variants, limit))
+    return asyncio.run(_expand_rephrase_async(seeds, config, output_dir, num_variants, limit, progress_callback))
 
 
 async def _expand_rephrase_async(
@@ -140,6 +168,7 @@ async def _expand_rephrase_async(
     output_dir: str,
     num_variants: int,
     limit: Optional[int],
+    progress_callback=None,
 ) -> list[dict]:
     client = create_client(config, "expansion")
     template = load_prompt("expand_rephrase")
@@ -150,40 +179,112 @@ async def _expand_rephrase_async(
     if limit:
         seeds = seeds[:limit]
 
-    results: list[tuple[int, list[dict]]] = []
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    results_file = output_path / f"{batch_id}.jsonl"
+
+    # 断点续传：加载已处理的 seed_id 清单
+    checkpoint_file = output_path / "rephrase_checkpoint.json"
+    processed_ids: set[str] = set()
+    if checkpoint_file.exists():
+        with open(checkpoint_file, "r", encoding="utf-8") as f:
+            processed_ids = set(json.load(f))
+
+    pending = [s for s in seeds if s.get("id", "") not in processed_ids]
+    skipped = len(seeds) - len(pending)
+    if skipped:
+        logger.info(f"改述跳过已处理 {skipped} 条种子，待处理 {len(pending)} 条")
+
+    if not pending:
+        return []
+
+    # ── 构建种子问题去重指纹：已有扩展的种子问题不再生成相似变体 ──
+    dedup = DedupTracker(threshold=0.65)
+    for s in seeds:
+        if s.get("id", "") in processed_ids:
+            dedup.add(s.get("question", ""))
+    if dedup.count:
+        logger.info(f"重复校验: 已加载 {dedup.count} 个已改述种子的问题指纹")
+
+    write_lock = asyncio.Lock()
+    total_written = 0
+    skipped_dedup = 0
+    seeds_done = 0
 
     async def process_one(i: int, seed: dict):
+        nonlocal total_written, skipped_dedup, seeds_done
+        seed_id = seed.get("id", "")
         async with sem:
-            logger.info(f"[改述 {i+1}/{len(seeds)}] {seed.get('question', '')[:50]}...")
-            prompt = _safe_format(
-                template,
-                num_variants=num_variants,
-                original_question=seed["question"],
-                original_answer=seed["answer"],
-                insurance_type=seed.get("insurance_type", "通用"),
-                difficulty=seed.get("difficulty", "入门"),
-                parent_id=seed.get("id", ""),
-            )
             try:
-                response = await client.acall(prompt)
-                variants = parse_json(response)
-                for j, v in enumerate(variants):
-                    v["id"] = f"{batch_id}_{i:04d}_{j:02d}"
-                    v["generation_method"] = "rephrase"
-                    v["parent_id"] = seed.get("id", "")
-                    v["batch_id"] = batch_id
-                    v["created_at"] = datetime.now().isoformat()
-                logger.info(f"  → {len(variants)} 个变体")
-                return i, variants
-            except Exception as e:
-                logger.error(f"  → 失败: {e}")
-                return i, []
+                if _check_stop():
+                    return i, []
 
-    tasks = [process_one(i, seed) for i, seed in enumerate(seeds)]
+                # 调用 LLM 前：检查该种子问题是否与已改述的种子高度相似
+                question = seed.get("question", "")
+                if not dedup.deduped_add(question):
+                    skipped_dedup += 1
+                    logger.info(f"  [{i+1}/{len(pending)}] 跳过（问题重复）: {question[:50]}...")
+                    return i, []
+
+                logger.info(f"[改述 {i+1}/{len(pending)}] {question[:50]}...")
+                prompt = _safe_format(
+                    template,
+                    num_variants=num_variants,
+                    original_question=seed["question"],
+                    original_answer=seed.get("answer", seed.get("summary", seed.get("description", ""))),
+                    insurance_type=seed.get("insurance_type", "其他保险"),
+                    difficulty=seed.get("difficulty", "入门"),
+                    parent_id=seed_id,
+                )
+                try:
+                    response = await client.acall(prompt)
+                    variants = parse_json(response)
+                    for j, v in enumerate(variants):
+                        v["id"] = f"{batch_id}_{i:04d}_{j:02d}"
+                        v["generation_method"] = "rephrase"
+                        v["parent_id"] = seed_id
+                        v["insurance_type"] = seed.get("insurance_type", "其他保险")
+                        v["batch_id"] = batch_id
+                        v["created_at"] = datetime.now().isoformat()
+                    variants = [_normalize_qa(v) for v in variants]
+                    variants = [v for v in variants if _is_valid_qa(v)]
+                    async with write_lock:
+                        with open(results_file, "a", encoding="utf-8") as f:
+                            for v in variants:
+                                f.write(json.dumps(v, ensure_ascii=False) + "\n")
+                        total_written += len(variants)
+                        processed_ids.add(seed_id)
+                        with open(checkpoint_file, "w", encoding="utf-8") as mf:
+                            json.dump(list(processed_ids), mf, ensure_ascii=False)
+                    logger.info(f"  → {len(variants)} 个变体（累计 {total_written}）")
+                    return i, variants
+                except Exception as e:
+                    logger.error(f"  → 失败: {e}")
+                    return i, []
+            finally:
+                seeds_done += 1
+                if progress_callback:
+                    progress_callback(seeds_done, len(pending))
+
+    tasks = [process_one(i, seed) for i, seed in enumerate(pending)]
     raw = await asyncio.gather(*tasks)
     all_expanded = [item for _, variants in sorted(raw) for item in variants]
 
-    _save_results(all_expanded, output_dir, batch_id, "rephrase")
+    # 保存报告（不覆盖 checkpoint 数据文件）
+    report = {
+        "batch_id": batch_id,
+        "method": "rephrase",
+        "total_generated": total_written,
+        "total_from_prev": skipped,
+        "skipped_dedup": skipped_dedup,
+        "time": datetime.now().isoformat(),
+        "api_usage": usage_stats.summary(),
+    }
+    report_file = output_path / f"{batch_id}_report.json"
+    with open(report_file, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+    logger.info(f"改述扩展完成，本批生成 {total_written} 条（跳过 {skipped} 已处理 + {skipped_dedup} 去重），输出至 {results_file}")
     return all_expanded
 
 
@@ -196,9 +297,10 @@ def expand_followup(
     output_dir: str,
     chain_length: int = 4,
     limit: Optional[int] = None,
+    progress_callback=None,
 ) -> list[dict]:
     """对每条种子生成追问链（并发）"""
-    return asyncio.run(_expand_followup_async(seeds, config, output_dir, chain_length, limit))
+    return asyncio.run(_expand_followup_async(seeds, config, output_dir, chain_length, limit, progress_callback))
 
 
 async def _expand_followup_async(
@@ -207,6 +309,7 @@ async def _expand_followup_async(
     output_dir: str,
     chain_length: int,
     limit: Optional[int],
+    progress_callback=None,
 ) -> list[dict]:
     client = create_client(config, "expansion")
     template = load_prompt("expand_followup")
@@ -217,37 +320,107 @@ async def _expand_followup_async(
     if limit:
         seeds = seeds[:limit]
 
-    async def process_one(i: int, seed: dict):
-        async with sem:
-            logger.info(f"[追问 {i+1}/{len(seeds)}] {seed.get('question', '')[:50]}...")
-            prompt = _safe_format(
-                template,
-                chain_length=chain_length,
-                original_question=seed["question"],
-                original_answer=seed["answer"],
-                insurance_type=seed.get("insurance_type", "通用"),
-                parent_id=seed.get("id", ""),
-            )
-            try:
-                response = await client.acall(prompt)
-                turns = parse_json(response)
-                for j, t in enumerate(turns):
-                    t["id"] = f"{batch_id}_{i:04d}_t{j+1:02d}"
-                    t["generation_method"] = "followup"
-                    t["parent_id"] = seed.get("id", "")
-                    t["batch_id"] = batch_id
-                    t["created_at"] = datetime.now().isoformat()
-                logger.info(f"  → {len(turns)} 轮追问")
-                return i, turns
-            except Exception as e:
-                logger.error(f"  → 失败: {e}")
-                return i, []
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    results_file = output_path / f"{batch_id}.jsonl"
 
-    tasks = [process_one(i, seed) for i, seed in enumerate(seeds)]
+    checkpoint_file = output_path / "followup_checkpoint.json"
+    processed_ids: set[str] = set()
+    if checkpoint_file.exists():
+        with open(checkpoint_file, "r", encoding="utf-8") as f:
+            processed_ids = set(json.load(f))
+
+    pending = [s for s in seeds if s.get("id", "") not in processed_ids]
+    skipped = len(seeds) - len(pending)
+    if skipped:
+        logger.info(f"追问跳过已处理 {skipped} 条种子，待处理 {len(pending)} 条")
+
+    if not pending:
+        return []
+
+    dedup = DedupTracker(threshold=0.65)
+    for s in seeds:
+        if s.get("id", "") in processed_ids:
+            dedup.add(s.get("question", ""))
+    if dedup.count:
+        logger.info(f"重复校验: 已加载 {dedup.count} 个已追问种子的问题指纹")
+
+    write_lock = asyncio.Lock()
+    total_written = 0
+    skipped_dedup = 0
+    seeds_done = 0
+
+    async def process_one(i: int, seed: dict):
+        nonlocal total_written, skipped_dedup, seeds_done
+        seed_id = seed.get("id", "")
+        async with sem:
+            try:
+                if _check_stop():
+                    return i, []
+
+                question = seed.get("question", "")
+                if not dedup.deduped_add(question):
+                    skipped_dedup += 1
+                    logger.info(f"  [{i+1}/{len(pending)}] 跳过（问题重复）: {question[:50]}...")
+                    return i, []
+
+                logger.info(f"[追问 {i+1}/{len(pending)}] {question[:50]}...")
+                prompt = _safe_format(
+                    template,
+                    chain_length=chain_length,
+                    original_question=seed["question"],
+                    original_answer=seed.get("answer", seed.get("summary", seed.get("description", ""))),
+                    insurance_type=seed.get("insurance_type", "其他保险"),
+                    parent_id=seed_id,
+                )
+                try:
+                    response = await client.acall(prompt)
+                    turns = parse_json(response)
+                    for j, t in enumerate(turns):
+                        t["id"] = f"{batch_id}_{i:04d}_t{j+1:02d}"
+                        t["generation_method"] = "followup"
+                        t["parent_id"] = seed_id
+                        t["insurance_type"] = seed.get("insurance_type", "其他保险")
+                        t["batch_id"] = batch_id
+                        t["created_at"] = datetime.now().isoformat()
+                    turns = [_normalize_qa(t) for t in turns]
+                    turns = [t for t in turns if _is_valid_qa(t)]
+                    async with write_lock:
+                        with open(results_file, "a", encoding="utf-8") as f:
+                            for t in turns:
+                                f.write(json.dumps(t, ensure_ascii=False) + "\n")
+                        total_written += len(turns)
+                        processed_ids.add(seed_id)
+                        with open(checkpoint_file, "w", encoding="utf-8") as mf:
+                            json.dump(list(processed_ids), mf, ensure_ascii=False)
+                    logger.info(f"  → {len(turns)} 轮追问（累计 {total_written}）")
+                    return i, turns
+                except Exception as e:
+                    logger.error(f"  → 失败: {e}")
+                    return i, []
+            finally:
+                seeds_done += 1
+                if progress_callback:
+                    progress_callback(seeds_done, len(pending))
+
+    tasks = [process_one(i, seed) for i, seed in enumerate(pending)]
     raw = await asyncio.gather(*tasks)
     all_expanded = [item for _, turns in sorted(raw) for item in turns]
 
-    _save_results(all_expanded, output_dir, batch_id, "followup")
+    report = {
+        "batch_id": batch_id,
+        "method": "followup",
+        "total_generated": total_written,
+        "total_from_prev": skipped,
+        "skipped_dedup": skipped_dedup,
+        "time": datetime.now().isoformat(),
+        "api_usage": usage_stats.summary(),
+    }
+    report_file = output_path / f"{batch_id}_report.json"
+    with open(report_file, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+    logger.info(f"追问扩展完成，本批生成 {total_written} 条（跳过 {skipped} 已处理 + {skipped_dedup} 去重），输出至 {results_file}")
     return all_expanded
 
 

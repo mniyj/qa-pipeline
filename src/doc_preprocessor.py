@@ -43,7 +43,7 @@ class DocumentMeta:
     file_path: str
     file_type: str                          # pdf / docx / txt
     doc_type: str = "未分类"                  # 条款 / 理赔指南 / 监管文件 / ...
-    insurance_type: str = "通用"              # 从文件名或内容推断
+    insurance_type: str = "其他保险"           # 从文件名或内容推断
     page_count: int = 0
     char_count: int = 0
     process_time: str = ""
@@ -194,12 +194,87 @@ def infer_doc_type(file_name: str, text_preview: str) -> str:
 
 
 def infer_insurance_type(file_name: str, text_preview: str) -> str:
-    """从文件名和内容前 500 字推断险种"""
-    combined = file_name + " " + text_preview[:500]
+    """从文件名（优先）和内容前 500 字推断险种"""
+    # 优先从文件名推断（文件名比正文更可靠，不易被上下文误命中）
     for ins_type, patterns in INSURANCE_TYPE_PATTERNS.items():
-        if any(re.search(p, combined) for p in patterns):
+        if any(re.search(p, file_name) for p in patterns):
             return ins_type
-    return "通用"
+    # 文件名无匹配时，再从内容推断
+    for ins_type, patterns in INSURANCE_TYPE_PATTERNS.items():
+        if any(re.search(p, text_preview[:500]) for p in patterns):
+            return ins_type
+    return "其他保险"
+
+
+# ---------- LLM 文档分类 ----------
+
+def _get_insurance_types(config: dict) -> list[str]:
+    return config.get("knowledge_schema", {}).get("insurance_types", [])
+
+
+def _load_classification_cache(chunks_dir: str) -> dict:
+    cache_file = Path(chunks_dir) / "classification_cache.json"
+    if cache_file.exists():
+        with open(cache_file, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_classification_cache(cache: dict, chunks_dir: str):
+    cache_file = Path(chunks_dir) / "classification_cache.json"
+    with open(cache_file, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+
+
+def classify_document_with_llm(
+    file_name: str,
+    text: str,
+    md5: str,
+    config: dict,
+    cache: dict,
+) -> tuple[str, str]:
+    """LLM 分类器：返回 (doc_type, insurance_type)。命中缓存直接返回；LLM 失败或返回非法值时回退正则结果。"""
+    if md5 in cache:
+        entry = cache[md5]
+        return entry["doc_type"], entry["insurance_type"]
+
+    doc_types_list       = config.get("preprocessing", {}).get("doc_types", [])
+    insurance_types_list = _get_insurance_types(config)
+
+    fallback_doc = infer_doc_type(file_name, text)
+    fallback_ins = infer_insurance_type(file_name, text)
+
+    try:
+        from llm_client import create_client
+        client = create_client(config, "classification")
+        prompt_path = Path(__file__).parent.parent / "prompts" / "classify_document.txt"
+        prompt_tpl  = prompt_path.read_text(encoding="utf-8")
+        prompt = prompt_tpl.format(
+            file_name=file_name,
+            text_preview=text[:1500],
+            doc_types="\n".join(f"- {t}" for t in doc_types_list),
+            insurance_types="\n".join(f"- {t}" for t in insurance_types_list),
+        )
+        response = client.call(prompt)
+        response = re.sub(r"```(?:json)?\s*", "", response).strip()
+        result   = json.loads(response)
+
+        doc_type = result.get("doc_type", "").strip()
+        ins_type = result.get("insurance_type", "").strip()
+
+        if doc_type not in doc_types_list:
+            logger.warning(f"LLM doc_type '{doc_type}' 不在 schema，回退: {fallback_doc}")
+            doc_type = fallback_doc
+        if ins_type not in insurance_types_list:
+            logger.warning(f"LLM insurance_type '{ins_type}' 不在 schema，回退: {fallback_ins}")
+            ins_type = fallback_ins
+
+    except Exception as e:
+        logger.warning(f"LLM 分类失败 ({file_name}): {e}，使用正则结果")
+        doc_type, ins_type = fallback_doc, fallback_ins
+
+    cache[md5] = {"doc_type": doc_type, "insurance_type": ins_type}
+    return doc_type, ins_type
 
 
 # ---------- 智能分块 ----------
@@ -328,6 +403,7 @@ def smart_chunk(
 def process_single_document(
     file_path: str,
     config: dict,
+    cache: dict | None = None,
 ) -> tuple[DocumentMeta, list[TextChunk]]:
     """处理单个文档，返回元信息和 chunk 列表"""
     file_path = str(file_path)
@@ -345,9 +421,9 @@ def process_single_document(
         logger.warning(f"文档无法提取文本，跳过: {file_name}")
         return None, []
 
-    # 3. 推断文档类型和险种
-    doc_type = infer_doc_type(file_name, text)
-    insurance_type = infer_insurance_type(file_name, text)
+    # 3. 分类文档类型和险种（LLM 优先，正则兜底）
+    _cache = cache if cache is not None else {}
+    doc_type, insurance_type = classify_document_with_llm(file_name, text, md5, config, _cache)
 
     # 4. 智能分块
     prep_config = config.get("preprocessing", {})
@@ -400,6 +476,7 @@ def process_all_documents(
     input_dir: str,
     output_dir: str,
     config: dict,
+    progress_callback=None,
 ) -> dict:
     """批量处理所有文档（增量：跳过已处理文件）"""
     input_path = Path(input_dir)
@@ -443,9 +520,11 @@ def process_all_documents(
     all_chunks = []
     failed_files = []
 
-    for file_path, md5 in new_files:
+    cache = _load_classification_cache(str(output_path))
+
+    for idx, (file_path, md5) in enumerate(new_files):
         try:
-            meta, chunks = process_single_document(str(file_path), config)
+            meta, chunks = process_single_document(str(file_path), config, cache)
             if meta:
                 all_metas.append(asdict(meta))
                 all_chunks.extend([asdict(c) for c in chunks])
@@ -453,6 +532,8 @@ def process_all_documents(
         except Exception as e:
             logger.error(f"处理失败: {file_path}, 错误: {e}")
             failed_files.append({"file": str(file_path), "error": str(e)})
+        if progress_callback:
+            progress_callback(idx + 1, len(new_files))
 
     # 追加新 chunks，跳过 chunk_id 已存在的（防止同一文件被 preprocess 重复写入）
     chunks_file = output_path / "chunks.jsonl"
@@ -482,6 +563,8 @@ def process_all_documents(
     # 更新清单
     with open(manifest_file, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+    _save_classification_cache(cache, str(output_path))
 
     # 追加文档元信息
     meta_file = output_path / "doc_metadata.json"

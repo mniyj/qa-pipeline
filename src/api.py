@@ -47,18 +47,28 @@ async def upload_document(file: UploadFile):
 
 
 @router_docs.get("/")
-async def list_documents():
-    files = []
+async def list_documents(page: int = 1, size: int = 50):
+    all_files = []
     if DOCS_DIR.exists():
         for path in sorted(DOCS_DIR.rglob("*")):
             if path.is_file() and not path.name.startswith("."):
-                files.append({
+                all_files.append({
                     "name": path.name,
                     "relative_path": str(path.relative_to(DOCS_DIR)),
                     "size": path.stat().st_size,
                     "modified": path.stat().st_mtime,
                 })
-    return {"files": files, "total": len(files)}
+    total = len(all_files)
+    size = min(max(size, 1), 200)
+    skip = (page - 1) * size
+    items = all_files[skip:skip + size]
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "size": size,
+        "pages": max(1, (total + size - 1) // size),
+    }
 
 
 @router_docs.delete("/{filename:path}")
@@ -86,12 +96,21 @@ async def start_pipeline(body: dict, background_tasks: BackgroundTasks):
     from src.pipeline_state import pipeline_state
     from src.pipeline_runner import run_step
     step = body.get("step", "all")
-    if step not in ("preprocess", "seed", "expand", "qc", "all"):
+    if step not in ("preprocess", "seed", "seed_dedup", "expand", "qc", "all"):
         raise HTTPException(400, f"未知步骤: {step}")
     if pipeline_state.is_running:
         raise HTTPException(409, "流水线正在运行中")
     background_tasks.add_task(run_step, step)
     return {"started": step}
+
+
+@router_pipeline.post("/stop")
+async def stop_pipeline():
+    from src.pipeline_state import pipeline_state
+    if not pipeline_state.is_running:
+        raise HTTPException(409, "流水线未在运行")
+    pipeline_state.request_stop()
+    return {"stopped": True}
 
 
 @router_pipeline.get("/events")
@@ -117,6 +136,30 @@ async def pipeline_events(request: Request):
 # ─── Data router ─────────────────────────────────────────────────────────────
 
 router_data = APIRouter(prefix="/api/data", tags=["data"])
+
+
+@router_data.get("/chunks/stats")
+async def chunks_stats():
+    """实时统计 chunks.jsonl 中的文档数、chunk 总数及每份文档的分布"""
+    def _calc():
+        from collections import Counter
+        filepath = BASE_DIR / "data" / "chunks" / "chunks.jsonl"
+        if not filepath.exists():
+            return {"total_chunks": 0, "total_docs": 0, "min": 0, "max": 0, "median": 0}
+        per_doc: Counter = Counter()
+        with open(filepath, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    per_doc[json.loads(line).get("doc_file", "")] += 1
+        counts = sorted(per_doc.values())
+        return {
+            "total_chunks": sum(counts),
+            "total_docs":   len(counts),
+            "min":          counts[0]  if counts else 0,
+            "max":          counts[-1] if counts else 0,
+            "median":       counts[len(counts) // 2] if counts else 0,
+        }
+    return await asyncio.to_thread(_calc)
 
 
 @router_data.get("/chunks")
@@ -195,6 +238,9 @@ async def reports_overview():
             if f.exists()
         ) if seeds_dir.exists() else 0
 
+        filter_file = expanded_dir / "seed_dedup_filter.json"
+        dup_count = len(json.loads(filter_file.read_text(encoding="utf-8"))) if filter_file.exists() else 0
+
         expanded_count = sum(
             sum(1 for line in open(f, encoding="utf-8") if line.strip())
             for f in expanded_dir.glob("*.jsonl")
@@ -202,10 +248,12 @@ async def reports_overview():
         ) if expanded_dir.exists() else 0
 
         return {
-            "preprocessing":  pre_report,
-            "seeds_total":    seeds_count,
-            "expanded_total": expanded_count,
-            "qc":             qc_report,
+            "preprocessing":       pre_report,
+            "seeds_total":         seeds_count,
+            "seeds_dedup_removed": dup_count,
+            "seeds_after_dedup":   seeds_count - dup_count,
+            "expanded_total":      expanded_count,
+            "qc":                  qc_report,
         }
     return await asyncio.to_thread(_load)
 

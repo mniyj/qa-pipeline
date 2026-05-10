@@ -10,6 +10,21 @@
   <style>
     [v-cloak] { display: none; }
     .line-clamp-2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    #sidebar {
+      position: fixed;
+      top: 49px; /* header height */
+      left: 0;
+      width: 11rem; /* w-44 */
+      bottom: 0;
+      overflow-y: auto;
+      z-index: 10;
+    }
+    #main-content {
+      margin-left: 11rem;
+      margin-top: 49px;
+      height: calc(100vh - 49px);
+      overflow-y: auto;
+    }
   </style>
 </head>
 <body class="bg-gray-50 text-gray-800 text-sm">
@@ -28,24 +43,22 @@
     </div>
   </header>
 
-  <div class="flex min-h-screen">
-    <!-- Sidebar -->
-    <nav class="w-44 bg-white border-r pt-4 px-2 flex flex-col gap-0.5 flex-shrink-0">
-      <button v-for="item in navItems" :key="item.key"
-              @click="currentPage = item.key"
-              :class="['w-full text-left px-3 py-2 rounded-lg font-medium transition-colors',
-                       currentPage === item.key
-                         ? 'bg-blue-50 text-blue-700'
-                         : 'text-gray-600 hover:bg-gray-100']">
-        <span class="mr-1.5">{{ item.icon }}</span>{{ item.label }}
-      </button>
-    </nav>
+  <!-- Sidebar: position fixed, always visible -->
+  <nav id="sidebar" class="bg-white border-r pt-4 px-2 flex flex-col gap-0.5">
+    <button v-for="item in navItems" :key="item.key"
+            @click="currentPage = item.key"
+            :class="['w-full text-left px-3 py-2 rounded-lg font-medium transition-colors',
+                     currentPage === item.key
+                       ? 'bg-blue-50 text-blue-700'
+                       : 'text-gray-600 hover:bg-gray-100']">
+      <span class="mr-1.5">{{ item.icon }}</span>{{ item.label }}
+    </button>
+  </nav>
 
-    <!-- Main -->
-    <main class="flex-1 p-6 overflow-auto min-w-0">
-      <component :is="pages[currentPage]" :pipeline-status="pipelineStatus" />
-    </main>
-  </div>
+  <!-- Main: scrollable, offset by sidebar width -->
+  <main id="main-content" class="p-6">
+    <component :is="pages[currentPage]" :pipeline-status="pipelineStatus" />
+  </main>
 </div>
 
 <script>
@@ -71,7 +84,9 @@ const PageDocuments = {
         上传中…
       </div>
 
-      <div v-if="files.length" class="bg-white border rounded-xl overflow-hidden mb-4">
+      <div class="text-xs text-gray-400 mb-3">共 {{ result.total.toLocaleString() }} 个文件</div>
+
+      <div v-if="result.items.length" class="bg-white border rounded-xl overflow-hidden mb-4">
         <table class="w-full">
           <thead class="bg-gray-50 text-gray-500 text-xs border-b">
             <tr>
@@ -81,7 +96,7 @@ const PageDocuments = {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="f in files" :key="f.relative_path" class="border-b last:border-0 hover:bg-gray-50">
+            <tr v-for="f in result.items" :key="f.relative_path" class="border-b last:border-0 hover:bg-gray-50">
               <td class="px-4 py-2.5 text-gray-700">{{ f.name }}</td>
               <td class="px-4 py-2.5 text-gray-400 text-xs">{{ fmtSize(f.size) }}</td>
               <td class="px-4 py-2.5 text-center">
@@ -91,22 +106,46 @@ const PageDocuments = {
             </tr>
           </tbody>
         </table>
+
+        <!-- Pagination -->
+        <div class="flex items-center gap-2 px-4 py-3 border-t text-xs flex-wrap">
+          <button @click="load(1)" :disabled="result.page<=1"
+                  class="px-2 py-1.5 border rounded disabled:opacity-30 hover:bg-gray-50 transition">«</button>
+          <button @click="load(result.page-1)" :disabled="result.page<=1"
+                  class="px-3 py-1.5 border rounded disabled:opacity-30 hover:bg-gray-50 transition">‹ 上一页</button>
+          <span class="text-gray-500">
+            第 <input type="number" v-model.number="jumpPage" @keyup.enter="goPage(jumpPage)"
+                      class="w-12 border rounded px-1 py-0.5 text-center text-xs" :min="1" :max="result.pages" />
+            / {{ result.pages }} 页
+          </span>
+          <button @click="load(result.page+1)" :disabled="result.page>=result.pages"
+                  class="px-3 py-1.5 border rounded disabled:opacity-30 hover:bg-gray-50 transition">下一页 ›</button>
+          <button @click="load(result.pages)" :disabled="result.page>=result.pages"
+                  class="px-2 py-1.5 border rounded disabled:opacity-30 hover:bg-gray-50 transition">»</button>
+        </div>
       </div>
       <p v-else class="text-gray-400 text-xs">暂无文档，请上传文件</p>
 
-      <button v-if="files.length" @click="startPreprocess"
+      <button v-if="result.total" @click="startPreprocess"
               class="mt-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium">
         开始预处理 →
       </button>
     </div>
   `,
   setup() {
-    const files = ref([]);
+    const result = reactive({ items: [], total: 0, page: 1, pages: 1 });
     const uploading = ref(false);
+    const jumpPage = ref(1);
 
-    async function load() {
-      const r = await fetch('/api/documents/');
-      files.value = (await r.json()).files;
+    async function load(page = 1) {
+      const n = Math.max(1, Math.min(page, result.pages || 1));
+      const r = await fetch('/api/documents/?page=' + n + '&size=50');
+      const d = await r.json();
+      result.items = d.items;
+      result.total = d.total;
+      result.page  = d.page;
+      result.pages = d.pages;
+      jumpPage.value = d.page;
     }
 
     async function upload(list) {
@@ -117,16 +156,17 @@ const PageDocuments = {
         await fetch('/api/documents/upload', { method: 'POST', body: form });
       }
       uploading.value = false;
-      load();
+      load(1);
     }
 
+    function goPage(p) { load(p); }
     function onDrop(e) { upload(e.dataTransfer.files); }
     function onSelect(e) { upload(e.target.files); }
 
     async function del(path) {
       if (!confirm('确认删除？')) return;
       await fetch('/api/documents/' + path, { method: 'DELETE' });
-      load();
+      load(Math.min(result.page, result.pages));
     }
 
     async function startPreprocess() {
@@ -144,8 +184,8 @@ const PageDocuments = {
       return (b / 1048576).toFixed(1) + ' MB';
     }
 
-    onMounted(load);
-    return { files, uploading, onDrop, onSelect, del, startPreprocess, fmtSize };
+    onMounted(() => load(1));
+    return { result, uploading, jumpPage, onDrop, onSelect, del, startPreprocess, fmtSize, load, goPage };
   },
 };
 
@@ -166,8 +206,11 @@ const PagePipeline = {
           </div>
           <div class="text-xs text-gray-400 mb-2">{{ statusText(step.status) }}</div>
           <div v-if="step.status === 'running'" class="h-1 rounded bg-gray-100 overflow-hidden">
-            <div class="h-1 bg-blue-500 rounded animate-pulse" style="width:60%"></div>
+            <div class="h-1 bg-blue-500 rounded transition-all duration-500"
+                 :style="{ width: (step.progress || 0) + '%' }"></div>
           </div>
+          <div v-if="step.status === 'running' && step.progress > 0"
+               class="text-xs text-blue-500 mt-1">{{ step.progress }}%</div>
           <div v-if="step.output_count" class="text-xs text-green-600 mt-1">
             输出 {{ step.output_count.toLocaleString() }} 条
           </div>
@@ -178,16 +221,28 @@ const PagePipeline = {
       </div>
 
       <!-- Control buttons -->
-      <div class="flex flex-wrap gap-2 mb-5">
-        <button @click="start('all')" :disabled="localStatus.is_running"
-                class="px-4 py-1.5 bg-blue-600 text-white rounded-lg disabled:opacity-40 hover:bg-blue-700 transition font-medium">
-          ▶ 全流程
-        </button>
-        <button v-for="s in ['preprocess','seed','expand','qc']" :key="s"
-                @click="start(s)" :disabled="localStatus.is_running"
-                class="px-3 py-1.5 bg-white border rounded-lg text-gray-600 disabled:opacity-40 hover:bg-gray-50 transition">
-          {{ stepLabel(s) }}
-        </button>
+      <div class="flex flex-wrap gap-2 mb-5 items-center">
+        <template v-if="localStatus.is_running">
+          <button @click="stop"
+                  class="px-4 py-1.5 bg-red-500 text-white rounded-lg hover:bg-red-600 transition font-medium flex items-center gap-1.5">
+            <span>⏹</span> 停止
+          </button>
+          <span class="text-xs text-red-400">当前步骤完成后将停止</span>
+        </template>
+        <template v-else>
+          <button @click="start('all')"
+                  class="px-4 py-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium">
+            ▶ 全流程
+          </button>
+          <button v-for="s in ['preprocess','seed','seed_dedup','expand','qc']" :key="s"
+                  @click="start(s)"
+                  :class="['px-3 py-1.5 border rounded-lg transition',
+                           s === 'seed_dedup'
+                             ? 'bg-teal-50 border-teal-300 text-teal-700 hover:bg-teal-100'
+                             : 'bg-white border-gray-300 text-gray-600 hover:bg-gray-50']">
+            {{ stepLabel(s) }}
+          </button>
+        </template>
       </div>
 
       <!-- Log console -->
@@ -217,8 +272,9 @@ const PagePipeline = {
         const ev = JSON.parse(e.data);
         if (ev.type === 'init') syncStatus(ev.state);
         else if (ev.type === 'step_update') {
-          localStatus.is_running = true;
           if (localStatus.steps[ev.step]) Object.assign(localStatus.steps[ev.step], ev);
+        } else if (ev.type === 'pipeline_done') {
+          syncStatus(ev.state);
         } else if (ev.type === 'log') {
           logs.value.push(ev);
           if (logs.value.length > 300) logs.value.shift();
@@ -249,18 +305,27 @@ const PagePipeline = {
         running: 'w-2 h-2 rounded-full bg-blue-500 animate-pulse',
         done:    'w-2 h-2 rounded-full bg-green-500',
         error:   'w-2 h-2 rounded-full bg-red-500',
+        stopped: 'w-2 h-2 rounded-full bg-yellow-500',
       }[s] || 'w-2 h-2 rounded-full bg-gray-300';
     }
     function statusText(s) {
-      return { idle: '待运行', running: '运行中…', done: '已完成', error: '出错' }[s] || s;
+      return { idle: '待运行', running: '运行中…', done: '已完成', error: '出错', stopped: '已停止' }[s] || s;
     }
     function stepLabel(s) {
-      return { preprocess: '预处理', seed: '种子生成', expand: '批量扩展', qc: '质检' }[s] || s;
+      return { preprocess: '预处理', seed: '种子生成', seed_dedup: '种子去重', expand: '批量扩展', qc: '质检' }[s] || s;
+    }
+
+    async function stop() {
+      const r = await fetch('/api/pipeline/stop', { method: 'POST' });
+      if (!r.ok) {
+        const d = await r.json();
+        alert(d.detail || '停止失败');
+      }
     }
 
     onMounted(connect);
     onUnmounted(() => { if (es) es.close(); });
-    return { logs, logEl, localStatus, start, dotClass, statusText, stepLabel };
+    return { logs, logEl, localStatus, start, stop, dotClass, statusText, stepLabel };
   },
 };
 
@@ -309,12 +374,20 @@ const PageChunks = {
       </div>
 
       <!-- Pagination -->
-      <div class="flex items-center gap-2 mt-4 text-xs">
+      <div class="flex items-center gap-2 mt-4 text-xs flex-wrap">
+        <button @click="load(1)" :disabled="result.page<=1"
+                class="px-2 py-1.5 border rounded disabled:opacity-30 hover:bg-gray-50 transition">«</button>
         <button @click="load(result.page-1)" :disabled="result.page<=1"
                 class="px-3 py-1.5 border rounded disabled:opacity-30 hover:bg-gray-50 transition">‹ 上一页</button>
-        <span class="text-gray-500">第 {{ result.page }} / {{ result.pages }} 页</span>
+        <span class="text-gray-500">
+          第 <input type="number" v-model.number="jumpPage" @keyup.enter="goPage(jumpPage)"
+                    class="w-12 border rounded px-1 py-0.5 text-center text-xs" :min="1" :max="result.pages" />
+          / {{ result.pages }} 页
+        </span>
         <button @click="load(result.page+1)" :disabled="result.page>=result.pages"
                 class="px-3 py-1.5 border rounded disabled:opacity-30 hover:bg-gray-50 transition">下一页 ›</button>
+        <button @click="load(result.pages)" :disabled="result.page>=result.pages"
+                class="px-2 py-1.5 border rounded disabled:opacity-30 hover:bg-gray-50 transition">»</button>
       </div>
     </div>
   `,
@@ -325,12 +398,15 @@ const PageChunks = {
     const loading = ref(false);
     const result = reactive({ items: [], total: 0, page: 1, pages: 1 });
     const opts = reactive({ doc_types: [], ins_types: [] });
+    const jumpPage = ref(1);
 
     async function load(page = 1) {
+      const n = Math.max(1, Math.min(page, result.pages || 1));
       loading.value = true; expanded.value = null;
-      const p = new URLSearchParams({ page, size: 20, doc_type: f.doc_type, insurance_type: f.insurance_type, search: search.value });
+      const p = new URLSearchParams({ page: n, size: 20, doc_type: f.doc_type, insurance_type: f.insurance_type, search: search.value });
       const r = await fetch('/api/data/chunks?' + p);
       Object.assign(result, await r.json());
+      jumpPage.value = result.page;
       if (!opts.doc_types.length && result.items.length) {
         opts.doc_types = [...new Set(result.items.map(c => c.doc_type).filter(Boolean))];
         opts.ins_types = [...new Set(result.items.map(c => c.insurance_type).filter(Boolean))];
@@ -338,8 +414,10 @@ const PageChunks = {
       loading.value = false;
     }
 
+    function goPage(p) { load(p); }
+
     onMounted(() => load(1));
-    return { f, search, expanded, loading, result, opts, load };
+    return { f, search, expanded, loading, result, opts, load, jumpPage, goPage };
   },
 };
 
@@ -528,14 +606,21 @@ const PageReports = {
       <h2 class="text-base font-semibold mb-4">数据报告</h2>
 
       <!-- Summary cards -->
-      <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-7">
+      <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 mb-7">
         <div class="bg-white border rounded-xl p-4 text-center shadow-sm">
           <div class="text-2xl font-bold text-blue-600">{{ n(ov.preprocessing?.total_chunks) }}</div>
           <div class="text-xs text-gray-400 mt-1">Chunks</div>
         </div>
         <div class="bg-white border rounded-xl p-4 text-center shadow-sm">
-          <div class="text-2xl font-bold text-purple-500">{{ n(ov.seeds_total) }}</div>
-          <div class="text-xs text-gray-400 mt-1">种子 Q&A</div>
+          <div class="text-2xl font-bold text-purple-400">{{ n(ov.seeds_total) }}</div>
+          <div class="text-xs text-gray-400 mt-1">种子（原始）</div>
+          <div v-if="ov.seeds_dedup_removed" class="text-xs text-red-300 mt-0.5">
+            −{{ n(ov.seeds_dedup_removed) }} 重复
+          </div>
+        </div>
+        <div class="bg-white border rounded-xl p-4 text-center shadow-sm">
+          <div class="text-2xl font-bold text-purple-600">{{ n(ov.seeds_after_dedup) }}</div>
+          <div class="text-xs text-gray-400 mt-1">种子（去重后）</div>
         </div>
         <div class="bg-white border rounded-xl p-4 text-center shadow-sm">
           <div class="text-2xl font-bold text-yellow-500">{{ n(ov.expanded_total) }}</div>
@@ -631,8 +716,709 @@ const PageReports = {
   },
 };
 
+// ─── Page: 流程介绍 ───────────────────────────────────────────────────────────
+const PageGuide = {
+  template: `
+  <div class="max-w-4xl">
+    <h2 class="text-base font-semibold mb-1">系统流程介绍</h2>
+    <p class="text-gray-500 text-xs mb-6">本系统将原始保险文档转化为大规模高质量问答对，供 RAG / Fine-tuning 使用。</p>
+
+    <!-- 总览流程图 -->
+    <div class="flex items-center gap-1 mb-8 overflow-x-auto pb-2">
+      <div v-for="(step, idx) in steps" :key="step.key" class="flex items-center gap-1 flex-shrink-0">
+        <div :class="['rounded-xl border-2 px-4 py-3 text-center min-w-[7rem]', step.color]">
+          <div class="text-xl mb-1">{{ step.icon }}</div>
+          <div class="font-semibold text-xs">{{ step.title }}</div>
+          <div class="text-xs opacity-70 mt-0.5">{{ step.subtitle }}</div>
+        </div>
+        <div v-if="idx < steps.length - 1" class="text-gray-400 text-lg font-bold flex-shrink-0">→</div>
+      </div>
+    </div>
+
+    <!-- 各步骤详情 -->
+    <div class="space-y-4">
+
+      <!-- Step 1 -->
+      <div class="bg-white border rounded-xl overflow-hidden">
+        <div class="bg-blue-50 border-b px-4 py-2.5 flex items-center gap-2">
+          <span class="text-lg">📄</span>
+          <span class="font-semibold text-blue-800">Step 1 · 文档预处理</span>
+          <span class="ml-auto text-xs text-blue-600 bg-blue-100 px-2 py-0.5 rounded-full">doc_preprocessor.py</span>
+        </div>
+        <div class="px-4 py-4 text-xs space-y-4">
+
+          <!-- 步骤流 -->
+          <div class="space-y-3">
+
+            <!-- 1 -->
+            <div class="flex gap-3">
+              <span class="w-5 h-5 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center font-bold flex-shrink-0 mt-0.5">1</span>
+              <div>
+                <div class="font-medium text-gray-800 mb-1">文件扫描与增量过滤</div>
+                <ul class="space-y-0.5 text-gray-600">
+                  <li>• 递归扫描 <code class="bg-gray-100 px-1 rounded">data/raw_documents/</code>，支持格式：<strong>PDF / DOCX / TXT / MD</strong></li>
+                  <li>• 对每个文件计算 <strong>MD5</strong>，与 <code class="bg-gray-100 px-1 rounded">processed_docs.json</code> 清单比对</li>
+                  <li>• MD5 已存在 → 跳过（即使文件名变更也能识别重复）；新文件 → 进入后续处理</li>
+                </ul>
+              </div>
+            </div>
+
+            <!-- 2 -->
+            <div class="flex gap-3">
+              <span class="w-5 h-5 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center font-bold flex-shrink-0 mt-0.5">2</span>
+              <div>
+                <div class="font-medium text-gray-800 mb-1">文本提取</div>
+                <div class="grid grid-cols-3 gap-2">
+                  <div class="bg-gray-50 rounded-lg p-2">
+                    <div class="font-medium text-gray-700 mb-1">PDF</div>
+                    <div class="text-gray-600">① <strong>pdfplumber</strong>（主，中文排版效果好，自动抽取表格转文字）<br/>② pypdf（fallback，pdfplumber 失败时）</div>
+                  </div>
+                  <div class="bg-gray-50 rounded-lg p-2">
+                    <div class="font-medium text-gray-700 mb-1">DOCX</div>
+                    <div class="text-gray-600">python-docx 逐段提取，以段落数 ÷ 20 估算页数</div>
+                  </div>
+                  <div class="bg-gray-50 rounded-lg p-2">
+                    <div class="font-medium text-gray-700 mb-1">TXT / MD</div>
+                    <div class="text-gray-600">直接读取全文，以字数 ÷ 1500 估算页数</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 3 -->
+            <div class="flex gap-3">
+              <span class="w-5 h-5 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center font-bold flex-shrink-0 mt-0.5">3</span>
+              <div class="flex-1">
+                <div class="font-medium text-gray-800 mb-1">文档类型 &amp; 险种分类（LLM 主分类，正则兜底）</div>
+                <div class="grid grid-cols-2 gap-2">
+                  <div>
+                    <div class="text-gray-500 mb-1">文档类型（8类）— LLM 读文件名 + 内容前 1500 字</div>
+                    <div class="flex flex-wrap gap-1">
+                      <span v-for="t in ['法律法规','保险条款','产品说明书','理赔指南','核保手册','监管文件','行业标准','未分类']" :key="t"
+                            class="px-1.5 py-0.5 bg-blue-50 text-blue-700 rounded">{{ t }}</span>
+                    </div>
+                    <div class="text-gray-500 mt-1.5 text-xs">LLM 返回非法值时回退正则结果；按文件 MD5 缓存，重新预处理不重复调用</div>
+                  </div>
+                  <div>
+                    <div class="text-gray-500 mb-1">险种（47类，监管标准）— LLM 从枚举列表中选取</div>
+                    <div class="flex flex-wrap gap-1 max-h-24 overflow-y-auto">
+                      <span v-for="t in ['机动车商业保险','交强险','其他机动车辆保险','企业财产保险','家庭财产保险','货物运输保险','船舶保险','建筑、安装工程保险','航空保险','航天保险','石油保险','核能保险','其他特殊风险财产保险','种植保险','养殖保险','林业保险','其他农业保险','农房保险','农机保险','渔船保险','涉农意外保险','温室大棚保险','其他涉农保险','公众责任保险','产品责任保险','雇主责任保险','职业责任保险','新型责任保险','其他责任保险','定期寿险','终身寿险','两全保险','普通年金保险','养老年金保险','医疗保险','疾病保险','护理保险','失能保险','医疗意外保险','意外伤害保险','健康委托管理产品','养老委托管理产品','个人类信用保险','企业类信用保险','融资性保证保险','非融资性保证保险','其他保险']" :key="t"
+                            class="px-1.5 py-0.5 bg-purple-50 text-purple-700 rounded text-xs">{{ t }}</span>
+                    </div>
+                    <div class="text-gray-500 mt-1.5 text-xs">prompt 中注入完整枚举约束；LLM 返回非法值时回退正则；兜底值"其他保险"</div>
+                  </div>
+                </div>
+                <!-- 提示词全文 -->
+                <div class="mt-3">
+                  <div class="font-medium text-gray-700 mb-1.5">提示词（classify_document.txt）</div>
+                  <pre class="bg-gray-900 text-green-300 rounded-lg p-3 overflow-x-auto leading-5 whitespace-pre-wrap text-xs">你是保险文档分类专家。请根据文件名和内容预览，从给定选项中选择最合适的文档类型和险种。
+
+文件名：{file_name}
+
+内容预览（前1500字）：
+{text_preview}
+
+【文档类型】必须从以下选项中精确选择一个：
+{doc_types}
+
+【险种】必须从以下选项中精确选择一个：
+{insurance_types}
+
+规则：
+- 如果文档涉及多个险种，选最主要的一个
+- 险种无法判断时选"其他保险"
+- 文档类型无法判断时选"未分类"
+
+只返回 JSON，不要任何其他说明：
+{"doc_type": "...", "insurance_type": "..."}</pre>
+                </div>
+              </div>
+            </div>
+
+            <!-- 4 -->
+            <div class="flex gap-3">
+              <span class="w-5 h-5 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center font-bold flex-shrink-0 mt-0.5">4</span>
+              <div class="flex-1">
+                <div class="font-medium text-gray-800 mb-2">智能分块（4 阶段）</div>
+                <div class="space-y-2">
+                  <div class="flex gap-2">
+                    <span class="text-gray-400 font-mono flex-shrink-0">4-a</span>
+                    <div class="text-gray-600">
+                      <span class="font-medium text-gray-700">章节边界识别</span>：正则扫描全文，匹配以下模式并记录位置
+                      <div class="mt-1 grid grid-cols-2 gap-x-4 gap-y-0.5 text-gray-500 font-mono">
+                        <span>第[一二三…]+[章节条]</span>
+                        <span>第\d+[章节条]</span>
+                        <span>[一二三…]+[、.．]</span>
+                        <span>\d+[、.．]\d*\s</span>
+                        <span class="col-span-2">保险责任 | 责任免除 | 免责 | 投保须知 | 理赔流程 | 保险金额 | 等待期 | 犹豫期 | 退保 | 续保</span>
+                      </div>
+                      <div class="text-gray-500 mt-0.5">仅接受行首附近（前置空白 ≤ 2 字符）的匹配，过滤正文中的偶发命中</div>
+                    </div>
+                  </div>
+                  <div class="flex gap-2">
+                    <span class="text-gray-400 font-mono flex-shrink-0">4-b</span>
+                    <div class="text-gray-600"><span class="font-medium text-gray-700">按边界切片</span>：将全文切成若干 section，每段对应一个识别到的章节范围</div>
+                  </div>
+                  <div class="flex gap-2">
+                    <span class="text-gray-400 font-mono flex-shrink-0">4-c</span>
+                    <div class="text-gray-600">
+                      <span class="font-medium text-gray-700">尺寸调整</span>（目标：300–1200 字）
+                      <ul class="mt-0.5 space-y-0.5 text-gray-500">
+                        <li>• section &lt; 1200 字 → 与相邻 section 合并，直到填满</li>
+                        <li>• section &gt; 1200 字 → 先按段落（空行）拆；段落仍超长则按固定步长（200 字重叠）强制切</li>
+                        <li>• 末尾碎片 &lt; 300 字 → 并入上一个 chunk，不单独成块</li>
+                      </ul>
+                    </div>
+                  </div>
+                  <div class="flex gap-2">
+                    <span class="text-gray-400 font-mono flex-shrink-0">4-d</span>
+                    <div class="text-gray-600">
+                      <span class="font-medium text-gray-700">元数据提取</span>：
+                      <code class="bg-gray-100 px-1 rounded">section_title</code>（首行匹配章节模式则截取前 50 字）；
+                      <code class="bg-gray-100 px-1 rounded">has_table</code>（含 <span class="font-mono">|│┃</span> 竖线符号）；
+                      <code class="bg-gray-100 px-1 rounded">has_numbers</code>（含 <span class="font-mono">%</span> 或 <span class="font-mono">元/万元/亿元</span>）
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 5 -->
+            <div class="flex gap-3">
+              <span class="w-5 h-5 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center font-bold flex-shrink-0 mt-0.5">5</span>
+              <div>
+                <div class="font-medium text-gray-800 mb-1">chunk_id 去重 &amp; 追加写入</div>
+                <ul class="space-y-0.5 text-gray-600">
+                  <li>• <code class="bg-gray-100 px-1 rounded">chunk_id</code> = <span class="font-mono text-gray-500">MD5前8位_chunk序号</span>（如 <span class="font-mono text-gray-500">2f9aa9f1_0003</span>）</li>
+                  <li>• 写入前先加载 <code class="bg-gray-100 px-1 rounded">chunks.jsonl</code> 中的已有 ID 集合，重复的跳过</li>
+                  <li>• 同一文件内容不变但文件名变更 → MD5 相同 → 整文件跳过；文件修改 → MD5 变 → 重新处理</li>
+                </ul>
+              </div>
+            </div>
+
+          </div>
+
+          <!-- 输出文件 & 当前数据 -->
+          <div class="grid grid-cols-2 gap-3 pt-1 border-t border-gray-100">
+            <div>
+              <div class="font-medium text-gray-700 mb-1.5">输出文件</div>
+              <ul class="space-y-1 text-gray-600">
+                <li>• <code class="bg-gray-100 px-1 rounded">chunks.jsonl</code> — 主数据，每行一个 chunk</li>
+                <li>• <code class="bg-gray-100 px-1 rounded">processed_docs.json</code> — MD5 增量清单</li>
+                <li>• <code class="bg-gray-100 px-1 rounded">doc_metadata.json</code> — 文档元信息汇总</li>
+                <li>• <code class="bg-gray-100 px-1 rounded">preprocess_report.json</code> — 文档类型 / 险种分布统计</li>
+                <li>• <code class="bg-gray-100 px-1 rounded">classification_cache.json</code> — LLM 分类结果缓存（按文件 MD5 索引）</li>
+              </ul>
+            </div>
+            <div class="bg-blue-50 rounded-lg p-2.5 text-gray-600">
+              <span class="font-medium">当前数据：</span>
+              <span v-if="stats.chunks">
+                {{ stats.chunks.total_docs }} 份文档 →
+                <strong>{{ stats.chunks.total_chunks.toLocaleString() }}</strong> 个 chunk
+                （每份文档 {{ stats.chunks.min }}–{{ stats.chunks.max }} 个，中位数 {{ stats.chunks.median }}）
+              </span>
+              <span v-else class="text-gray-400">加载中…</span>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- Step 2 -->
+      <div class="bg-white border rounded-xl overflow-hidden">
+        <div class="bg-purple-50 border-b px-4 py-2.5 flex items-center gap-2">
+          <span class="text-lg">🌱</span>
+          <span class="font-semibold text-purple-800">Step 2 · 种子生成</span>
+          <span class="ml-auto text-xs text-purple-600 bg-purple-100 px-2 py-0.5 rounded-full">seed_generator.py</span>
+        </div>
+        <div class="px-4 py-3 grid grid-cols-2 gap-4 text-xs">
+          <div>
+            <div class="font-medium text-gray-700 mb-1.5">核心思路</div>
+            <p class="text-gray-600 mb-2">调用高质量 LLM（DeepSeek），基于每个 chunk 原文生成多样化问答对，作为后续扩展的"种子"。</p>
+            <div class="font-medium text-gray-700 mb-1.5">问题覆盖类型</div>
+            <ul class="space-y-1 text-gray-600">
+              <li>• 概念解释 / 条款解读 / 流程指引</li>
+              <li>• 边界判断 / 计算说明 / 对比区分</li>
+              <li>• 产品对比 / 注意事项</li>
+            </ul>
+            <div class="font-medium text-gray-700 mt-2 mb-1.5">难度分布</div>
+            <ul class="space-y-1 text-gray-600">
+              <li>• 入门级 40%（普通消费者）</li>
+              <li>• 进阶级 40%（代理人水平）</li>
+              <li>• 专业级 20%（核保 / 合规）</li>
+            </ul>
+          </div>
+          <div>
+            <div class="font-medium text-gray-700 mb-1.5">关键设计</div>
+            <ul class="space-y-1 text-gray-600">
+              <li>• 问题中<strong>必须包含产品名称</strong>（避免通用问题）</li>
+              <li>• 答案引用具体条款和数字，末尾附免责声明</li>
+              <li>• 并发度 20，单 chunk 约 3–5 秒</li>
+            </ul>
+            <div class="font-medium text-gray-700 mt-3 mb-1.5">断点续传</div>
+            <ul class="space-y-1 text-gray-600">
+              <li>• <code class="bg-gray-100 px-1 rounded">seeded_chunks.json</code> 记录已处理 chunk</li>
+              <li>• 重跑自动跳过，逐 chunk 写入防崩溃丢数</li>
+            </ul>
+            <div class="mt-3 bg-purple-50 rounded-lg p-2.5 text-gray-600">
+              <span class="font-medium">当前数据：</span>
+              <span v-if="stats.seeds != null">
+                已处理 {{ stats.chunks ? stats.chunks.total_chunks.toLocaleString() : '?' }} 个 chunk →
+                生成 <strong>{{ stats.seeds.toLocaleString() }}</strong> 条种子 Q&A
+                （平均 {{ stats.chunks && stats.chunks.total_chunks ? (stats.seeds / stats.chunks.total_chunks).toFixed(1) : '?' }} 对/chunk）
+              </span>
+              <span v-else class="text-gray-400">加载中…</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 提示词全文 -->
+        <div class="px-4 pb-4 border-t pt-3 text-xs">
+          <div class="font-medium text-gray-700 mb-1.5">提示词（seed_from_document.txt）</div>
+          <pre class="bg-gray-900 text-green-300 rounded-lg p-3 overflow-x-auto leading-5 whitespace-pre-wrap text-xs">你是资深保险领域知识工程师，拥有 15 年中国保险行业经验，精通保险条款解读、理赔实务、核保规则和监管法规。你的任务是基于提供的保险原始文档，生成高质量的问答对，用于构建保险知识库。
+
+请基于以下保险文档内容，生成 {num_pairs} 组问答对。
+
+## 文档元信息
+- 文档类型：{doc_type}
+- 险种分类：{insurance_type}
+- 所属章节：{section_title}
+- 文件名称：{doc_file}
+
+## 文档原文
+&lt;document&gt;
+{document_content}
+&lt;/document&gt;
+
+## 生成要求
+
+### 问题要求
+1. 模拟真实用户的提问方式，口语化但准确；若文档内容来自特定保险产品，问题中必须包含该产品名称
+   （例如"中意真爱久久养老年金保险的犹豫期是多少天？"，而不是"犹豫期是多少天？"）
+2. 覆盖以下问题类型中尽可能多的种类：
+   概念解释 / 流程指引 / 条款解读 / 边界判断 / 计算说明 / 对比区分 / 产品对比 / 注意事项
+3. 难度分布：40% 入门级（普通消费者能懂）、40% 进阶级（代理人水平）、20% 专业级
+
+### 答案要求
+1. 答案必须能从文档原文中找到依据，如果文档未提及则明确说明"根据当前条款未涉及此内容"
+2. 答案应自成体系，不依赖额外上下文
+3. 包含关键数字/期限/比例（如果文档中有）
+4. 入门级 80–150 字，进阶级 150–300 字，专业级 300–500 字
+5. 凡引用具体条款或数字，须在该句后注明所依据文件名称及其施行/修订年份
+   例如"（依据《健康保险管理办法》2019年修订版第X条）"
+6. {disclaimer}
+   （法律法规 / 监管文件 / 行业标准 → 附加"以上内容依据{doc_file}，法规条款可能随监管政策调整而变化，请以最新发布的官方文件为准。"；其他文档类型 → 无需附加）
+
+### 输出格式
+请严格输出 JSON 数组，不要包含 markdown 代码块标记：
+[
+  {
+    "question": "问题文本",
+    "answer": "答案文本",
+    "difficulty": "入门|进阶|专业",
+    "question_type": "概念解释|流程指引|条款解读|边界判断|计算说明|对比区分|注意事项|产品对比",
+    "insurance_type": "{insurance_type}",
+    "business_stage": "根据内容判断",
+    "source_reference": "条款第X条 或 文档第X段",
+    "tags": ["标签1", "标签2"]
+  }
+]</pre>
+        </div>
+      </div>
+
+      <!-- Step 2b -->
+      <div class="bg-white border rounded-xl overflow-hidden">
+        <div class="bg-teal-50 border-b px-4 py-2.5 flex items-center gap-2">
+          <span class="text-lg">🧹</span>
+          <span class="font-semibold text-teal-800">Step 2b · 种子前置去重</span>
+          <span class="ml-auto text-xs text-teal-600 bg-teal-100 px-2 py-0.5 rounded-full">quality_checker.py</span>
+          <span class="text-xs bg-teal-700 text-white px-2 py-0.5 rounded-full">节省 token</span>
+        </div>
+        <div class="px-4 py-3 grid grid-cols-2 gap-4 text-xs">
+          <div>
+            <div class="font-medium text-gray-700 mb-1.5">为什么要前置去重？</div>
+            <p class="text-gray-600 mb-2">质检统计显示：种子 Q&A 中有 <strong>~46% 是语义重复的</strong>（不同 chunk 对同一概念各自生成了相似问题）。如果让这些重复种子进入扩展，每条重复种子会浪费 5–8 次 LLM 调用（改述 × 5 + 追问 × 4）。</p>
+            <div class="font-medium text-gray-700 mb-1.5">方法</div>
+            <ul class="space-y-1 text-gray-600">
+              <li>• 加载全部种子问题文本</li>
+              <li>• 用 <code class="bg-gray-100 px-1 rounded">sentence-transformers</code> 计算 embedding</li>
+              <li>• 余弦相似度 &gt; 0.92 视为重复，保留先出现的</li>
+              <li>• 将重复 ID 写入过滤清单，不修改原始文件</li>
+            </ul>
+          </div>
+          <div>
+            <div class="font-medium text-gray-700 mb-1.5">节省效果</div>
+            <div class="space-y-2 text-gray-600">
+              <div class="bg-red-50 border border-red-200 rounded-lg p-2.5">
+                <div class="font-medium text-red-700 mb-1">优化前</div>
+                <div>51,768 条种子 × 9 次扩展 = <strong>~466K 次 LLM 调用</strong></div>
+              </div>
+              <div class="bg-green-50 border border-green-200 rounded-lg p-2.5">
+                <div class="font-medium text-green-700 mb-1">优化后（估算）</div>
+                <div>~28K 唯一种子 × 9 次扩展 = <strong>~252K 次 LLM 调用</strong></div>
+                <div class="text-green-600 font-semibold mt-1">节省约 46% token</div>
+              </div>
+            </div>
+            <div class="font-medium text-gray-700 mt-3 mb-1.5">断点续传</div>
+            <ul class="space-y-1 text-gray-600">
+              <li>• <code class="bg-gray-100 px-1 rounded">seed_dedup_state.json</code> 记录种子文件 mtime</li>
+              <li>• 种子文件无变化时直接复用已有过滤清单</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <!-- Step 3 -->
+      <div class="bg-white border rounded-xl overflow-hidden">
+        <div class="bg-yellow-50 border-b px-4 py-2.5 flex items-center gap-2">
+          <span class="text-lg">📈</span>
+          <span class="font-semibold text-yellow-800">Step 3 · 批量扩展</span>
+          <span class="ml-auto text-xs text-yellow-600 bg-yellow-100 px-2 py-0.5 rounded-full">expander.py</span>
+        </div>
+        <div class="px-4 py-4 text-xs space-y-5">
+          <p class="text-gray-600">将种子 Q&A 通过三种方式扩展到 10 万+，增加问法多样性和覆盖深度。每种扩展方式独立并发，均有断点续传。</p>
+
+          <!-- 流程示意 -->
+          <div class="flex items-start gap-2 overflow-x-auto pb-1">
+            <div class="flex-shrink-0 bg-purple-50 border border-purple-200 rounded-lg px-3 py-2 text-center">
+              <div class="font-semibold text-purple-700">种子 Q&A</div>
+              <div class="text-purple-500">~5 万条</div>
+            </div>
+            <div class="flex-shrink-0 flex flex-col gap-1.5 pt-1">
+              <div class="text-gray-400">→</div><div class="text-gray-400">→</div><div class="text-gray-400">→</div>
+            </div>
+            <div class="flex-shrink-0 flex flex-col gap-1.5">
+              <div class="bg-orange-50 border border-orange-200 rounded px-2.5 py-1.5">① 改述变体 × 5 → <strong>25万条</strong></div>
+              <div class="bg-blue-50 border border-blue-200 rounded px-2.5 py-1.5">② 追问链 × 4轮 → <strong>20万条</strong></div>
+              <div class="bg-teal-50 border border-teal-200 rounded px-2.5 py-1.5">③ 模板驱动（文档参数化） → <strong>数千条</strong></div>
+            </div>
+            <div class="flex-shrink-0 flex flex-col gap-1.5 pt-1">
+              <div class="text-gray-400">↘</div><div class="text-gray-400">→</div><div class="text-gray-400">↗</div>
+            </div>
+            <div class="flex-shrink-0 bg-green-50 border border-green-200 rounded-lg px-3 py-2 text-center self-center">
+              <div class="font-semibold text-green-700">扩展 Q&A 汇总</div>
+              <div class="text-green-500">~45万条 → 质检</div>
+            </div>
+          </div>
+
+          <!-- 方式一 -->
+          <div class="border border-orange-200 rounded-xl overflow-hidden">
+            <div class="bg-orange-50 px-3 py-2 flex items-center gap-2">
+              <span class="font-semibold text-orange-800">① 改述变体（Rephrase）</span>
+              <span class="ml-auto text-orange-500">并发 5 · 每种子 ~5变体</span>
+            </div>
+            <div class="p-3 space-y-2">
+              <div class="text-gray-600">
+                <span class="font-medium">核心逻辑：</span>对同一知识点生成多种不同问法，答案核心不变但表述微调。
+                强制要求覆盖至少 3 种维度：<span class="text-orange-700 font-medium">直接提问 / 场景嵌入 / 反问确认 / 对比切入 / 口语化</span>。
+              </div>
+              <div>
+                <div class="font-medium text-gray-700 mb-1">提示词（expand_rephrase.txt）</div>
+                <pre class="bg-gray-900 text-green-300 rounded-lg p-3 overflow-x-auto leading-5 whitespace-pre-wrap text-xs">你是保险知识问答改写专家。请将以下保险问答对扩展为 {num_variants} 个改述变体。
+
+## 原始问答
+- 问题：{original_question}
+- 答案：{original_answer}
+- 险种：{insurance_type}
+- 难度：{difficulty}
+
+## 改述要求
+1. 每个变体的提问方式必须明显不同，覆盖以下至少 3 种维度：
+   - 直接提问："XX 是什么？"
+   - 场景嵌入："我遇到了 XX 情况，想问问……"
+   - 反问确认："XX 是不是意味着……？"
+   - 对比切入："XX 和 YY 是一回事吗？"
+   - 口语化："那个啥，就是说……能赔不？"
+2. 答案根据问法微调表述，核心信息不变
+3. 避免仅替换个别词语的"伪变体"
+4. 原始答案中的条款版本注释和末尾免责提示必须完整保留
+
+输出 JSON 数组：
+[{ "question", "answer", "difficulty", "question_type",
+   "insurance_type", "rephrasing_type", "parent_id" }]</pre>
+              </div>
+              <div class="grid grid-cols-3 gap-2 text-gray-600">
+                <div class="bg-gray-50 rounded p-2"><span class="font-medium">输入字段：</span><br/>original_question<br/>original_answer<br/>insurance_type / difficulty</div>
+                <div class="bg-gray-50 rounded p-2"><span class="font-medium">输出新增字段：</span><br/>rephrasing_type（改述类型）<br/>parent_id（溯源至种子）</div>
+                <div class="bg-orange-50 rounded p-2"><span class="font-medium">断点续传：</span><br/>rephrase_checkpoint.json<br/>按 parent_id 记录<br/>重启自动跳过</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 方式二 -->
+          <div class="border border-blue-200 rounded-xl overflow-hidden">
+            <div class="bg-blue-50 px-3 py-2 flex items-center gap-2">
+              <span class="font-semibold text-blue-800">② 追问链（Follow-up）</span>
+              <span class="ml-auto text-blue-500">并发 5 · 每种子 4 轮追问</span>
+            </div>
+            <div class="p-3 space-y-2">
+              <div class="text-gray-600">
+                <span class="font-medium">核心逻辑：</span>模拟真实用户与客服的多轮对话。每轮追问是对上一轮答案的自然延伸，
+                覆盖方向：<span class="text-blue-700 font-medium">深入细节 / 边界探索 / 实操追问 / 费用时间 / 补救方案</span>。
+              </div>
+              <div>
+                <div class="font-medium text-gray-700 mb-1">提示词（expand_followup.txt）</div>
+                <pre class="bg-gray-900 text-green-300 rounded-lg p-3 overflow-x-auto leading-5 whitespace-pre-wrap text-xs">你是保险客服对话模拟器。请基于以下问答，生成一条自然的 {chain_length} 轮追问链。
+
+## 初始问答
+- 问题：{original_question}
+- 答案：{original_answer}
+- 险种：{insurance_type}
+
+## 要求
+1. 每轮追问是看完上一轮答案后的自然延伸，不能跳跃
+2. 追问方向至少覆盖 3 种：
+   深入细节 / 边界探索 / 实操追问 / 费用时间 / 补救方案
+3. 模拟真实对话节奏：越往后越具体
+4. 问题要有情绪和细节（具体数字、时间线）
+5. 每轮答案引用条款时须注明文件版本；
+   末尾保留免责提示
+
+输出 JSON 数组（每轮为独立问答对）：
+[{ "question", "answer", "difficulty", "question_type",
+   "insurance_type", "follow_up_type", "turn", "parent_id" }]</pre>
+              </div>
+              <div class="grid grid-cols-3 gap-2 text-gray-600">
+                <div class="bg-gray-50 rounded p-2"><span class="font-medium">输入字段：</span><br/>original_question<br/>original_answer<br/>insurance_type</div>
+                <div class="bg-gray-50 rounded p-2"><span class="font-medium">输出新增字段：</span><br/>follow_up_type（追问类型）<br/>turn（第几轮，1–4）<br/>parent_id（溯源至种子）</div>
+                <div class="bg-blue-50 rounded p-2"><span class="font-medium">断点续传：</span><br/>followup_checkpoint.json<br/>按 parent_id 记录<br/>重启自动跳过</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 方式三 -->
+          <div class="border border-teal-200 rounded-xl overflow-hidden">
+            <div class="bg-teal-50 px-3 py-2 flex items-center gap-2">
+              <span class="font-semibold text-teal-800">③ 模板驱动（Template）</span>
+              <span class="ml-auto text-teal-500">文档参数化 · 无需种子</span>
+            </div>
+            <div class="p-3 space-y-2">
+              <div class="text-gray-600">
+                <span class="font-medium">核心逻辑：</span>先从文档 chunks 中提取结构化参数（金额、期限、除外责任、操作流程等），
+                再将参数填入预定义句式模板，生成问题后由 LLM 基于相关 chunks 作答。
+                额外支持跨险种对比问题（如"重疾险 vs 百万医疗险"）。
+              </div>
+              <div class="grid grid-cols-2 gap-3">
+                <div>
+                  <div class="font-medium text-gray-700 mb-1.5">通用模板句式</div>
+                  <div class="space-y-1">
+                    <div v-for="t in templates" :key="t.name" class="flex gap-2">
+                      <span class="text-teal-600 font-medium w-16 flex-shrink-0">{{ t.name }}</span>
+                      <span class="text-gray-600 italic">{{ t.tpl }}</span>
+                    </div>
+                  </div>
+                </div>
+                <div>
+                  <div class="font-medium text-gray-700 mb-1.5">险种专属模板（示例）</div>
+                  <div class="space-y-1 text-gray-600">
+                    <div><span class="text-teal-600 font-medium">重疾险：</span>轻重症区分、带病投保规则</div>
+                    <div><span class="text-teal-600 font-medium">医疗险：</span>社保衔接、免赔额规则</div>
+                    <div><span class="text-teal-600 font-medium">车险：</span>定损流程、NCD折扣计算</div>
+                    <div><span class="text-teal-600 font-medium">企业险：</span>责任认定、理赔材料清单</div>
+                    <div class="mt-1"><span class="text-teal-600 font-medium">跨险种对比：</span>{{ crossCount }} 组预设对比对（重疾 vs 医疗 / 年金 vs 增额寿 等）</div>
+                  </div>
+                </div>
+              </div>
+              <div class="bg-teal-50 rounded-lg p-2.5 text-gray-600">
+                <span class="font-medium">断点续传：</span>
+                <code class="bg-white px-1 rounded">template_processed.json</code>
+                以问题文本为 key 记录已处理项，重启不重复生成。
+              </div>
+            </div>
+          </div>
+
+          <!-- 并发 & 调度 -->
+          <div class="bg-gray-50 border rounded-xl p-3 space-y-1.5 text-gray-600">
+            <div class="font-medium text-gray-700">调度 & 容错机制</div>
+            <div class="grid grid-cols-2 gap-x-6 gap-y-1">
+              <div>• <span class="font-medium">asyncio.Semaphore</span> 控制并发（默认 5），防止 API 限速</div>
+              <div>• 每条种子完成后<span class="font-medium">立即追加写入</span> JSONL，进程崩溃不丢数据</div>
+              <div>• <span class="font-medium">expanded_seeds.json</span> 记录已完整处理的种子文件，文件级跳过</div>
+              <div>• LLM 返回截断 JSON 时自动修复（补 <code class="bg-white px-0.5 rounded">]</code>），减少丢弃率</div>
+              <div>• 每次运行生成新 batch_id，输出追加到新 JSONL 文件</div>
+              <div>• 收到停止信号后当前 chunk 完成后优雅退出，不丢中间结果</div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- Step 4 -->
+      <div class="bg-white border rounded-xl overflow-hidden">
+        <div class="bg-green-50 border-b px-4 py-2.5 flex items-center gap-2">
+          <span class="text-lg">✅</span>
+          <span class="font-semibold text-green-800">Step 4 · 质量检查</span>
+          <span class="ml-auto text-xs text-green-600 bg-green-100 px-2 py-0.5 rounded-full">quality_checker.py</span>
+        </div>
+        <div class="px-4 py-3 grid grid-cols-2 gap-4 text-xs">
+          <div>
+            <div class="font-medium text-gray-700 mb-1.5">三道过滤</div>
+            <div class="text-gray-500 mb-2">语义去重已前置到 Step 2b，质检阶段不再重复计算，速度更快。</div>
+            <div class="space-y-2">
+              <div class="flex gap-2">
+                <span class="w-5 h-5 rounded-full bg-green-100 text-green-700 flex items-center justify-center font-bold flex-shrink-0">1</span>
+                <div><span class="font-medium">格式校验</span>：必填字段、长度范围（问题 8–500字，答案 20–2000字）、拒答检测</div>
+              </div>
+              <div class="flex gap-2">
+                <span class="w-5 h-5 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center font-bold flex-shrink-0">2</span>
+                <div><span class="font-medium">兜底去重（增量）</span>：以历史已通过数据为基准，新条目只与基准 + 本批内部比对（embedding 或 n-gram），捕获扩展阶段引入的新重复，不对历史数据重跑</div>
+              </div>
+              <div class="flex gap-2">
+                <span class="w-5 h-5 rounded-full bg-yellow-100 text-yellow-700 flex items-center justify-center font-bold flex-shrink-0">3</span>
+                <div><span class="font-medium">事实校验</span>：规则引擎核查交强险限额、等待期天数、犹豫期等已知事实</div>
+              </div>
+              <div class="flex gap-2">
+                <span class="w-5 h-5 rounded-full bg-purple-100 text-purple-700 flex items-center justify-center font-bold flex-shrink-0">4</span>
+                <div><span class="font-medium">覆盖率分析</span>：统计险种 × 问题类型的覆盖矩阵，识别空白和薄弱区域</div>
+              </div>
+            </div>
+          </div>
+          <div>
+            <div class="font-medium text-gray-700 mb-1.5">输出文件</div>
+            <ul class="space-y-1 text-gray-600">
+              <li>• <code class="bg-gray-100 px-1 rounded">qa_passed.jsonl</code> — 历次通过质检的 Q&A（追加写入）</li>
+              <li>• <code class="bg-gray-100 px-1 rounded">qa_rejected.jsonl</code> — 被拒绝的（含原因，追加写入）</li>
+              <li>• <code class="bg-gray-100 px-1 rounded">qc_manifest.json</code> — 已质检文件清单（filepath → mtime）</li>
+              <li>• <code class="bg-gray-100 px-1 rounded">qc_report.json</code> — 各阶段统计报告</li>
+            </ul>
+            <div class="font-medium text-gray-700 mt-3 mb-1.5">断点续传（真增量）</div>
+            <ul class="space-y-1 text-gray-600">
+              <li>• <code class="bg-gray-100 px-1 rounded">qc_manifest.json</code> 按文件 mtime 判断，未变化文件直接跳过</li>
+              <li>• <strong>格式校验 / 事实校验</strong>：只对新增文件的条目运行，历史通过数据不重复处理</li>
+              <li>• <strong>兜底去重</strong>：加载 <code class="bg-gray-100 px-1 rounded">qa_passed.jsonl</code> 作为基准，新条目只需与历史 + 本批已通过的条目比对，无需对全量数据重跑 embedding</li>
+              <li>• 新通过的条目<strong>追加</strong>写入 <code class="bg-gray-100 px-1 rounded">qa_passed.jsonl</code>，历史结果永久保留</li>
+            </ul>
+            <div class="mt-3 bg-green-50 rounded-lg p-2.5 text-gray-600">
+              <span class="font-medium">当前数据：</span>
+              <span v-if="stats.qc">
+                本次新增 {{ (stats.qc.new_input || 0).toLocaleString() }} 条 →
+                本次通过 <strong>{{ (stats.qc.passed_new || stats.qc.passed_total || 0).toLocaleString() }}</strong> 条 ·
+                累计通过 <strong class="text-green-700">{{ stats.qc.passed_total.toLocaleString() }}</strong> 条
+                （通过率 {{ stats.qc.pass_rate }}）
+              </span>
+              <span v-else class="text-gray-400">加载中…</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 数据流汇总 -->
+      <div class="bg-white border rounded-xl overflow-hidden">
+        <div class="bg-gray-50 border-b px-4 py-2.5">
+          <span class="font-semibold text-gray-700">数据量流转示意</span>
+        </div>
+        <div class="px-4 py-3">
+          <div class="flex items-center gap-2 text-xs overflow-x-auto pb-1">
+            <div v-for="(node, i) in dataFlow" :key="i" class="flex items-center gap-2 flex-shrink-0">
+              <div class="text-center">
+                <div :class="['text-lg font-bold', node.color]">{{ node.count }}</div>
+                <div class="text-gray-500 text-xs">{{ node.label }}</div>
+              </div>
+              <div v-if="i < dataFlow.length - 1" class="flex flex-col items-center text-gray-400 flex-shrink-0">
+                <span class="text-base">→</span>
+                <span class="text-xs">{{ node.op }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 技术架构 -->
+      <div class="bg-white border rounded-xl overflow-hidden">
+        <div class="bg-gray-50 border-b px-4 py-2.5">
+          <span class="font-semibold text-gray-700">技术架构</span>
+        </div>
+        <div class="px-4 py-3 grid grid-cols-3 gap-4 text-xs">
+          <div>
+            <div class="font-medium text-gray-700 mb-1.5">后端</div>
+            <ul class="space-y-1 text-gray-500">
+              <li>• FastAPI + uvicorn</li>
+              <li>• SSE 实时推送日志</li>
+              <li>• asyncio 并发 LLM 调用</li>
+              <li>• 后台线程运行 pipeline</li>
+            </ul>
+          </div>
+          <div>
+            <div class="font-medium text-gray-700 mb-1.5">LLM</div>
+            <ul class="space-y-1 text-gray-500">
+              <li>• DeepSeek API（OpenAI 兼容）</li>
+              <li>• 种子生成：并发 20</li>
+              <li>• 扩展：并发 5</li>
+              <li>• 自动重试 + 断点续传</li>
+            </ul>
+          </div>
+          <div>
+            <div class="font-medium text-gray-700 mb-1.5">前端</div>
+            <ul class="space-y-1 text-gray-500">
+              <li>• Vue 3 Composition API（CDN）</li>
+              <li>• Tailwind CSS CDN</li>
+              <li>• Chart.js 可视化</li>
+              <li>• 服务端分页（JSONL 流式读取）</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+  `,
+  setup() {
+    const steps = [
+      { key: 'pre',       icon: '📄', title: '文档预处理', subtitle: '分块 + 元数据',    color: 'border-blue-300 bg-blue-50 text-blue-800' },
+      { key: 'seed',      icon: '🌱', title: '种子生成',   subtitle: 'LLM 生成 Q&A',    color: 'border-purple-300 bg-purple-50 text-purple-800' },
+      { key: 'dedup',     icon: '🧹', title: '种子去重',   subtitle: '前置过滤重复',      color: 'border-teal-300 bg-teal-50 text-teal-800' },
+      { key: 'expand',    icon: '📈', title: '批量扩展',   subtitle: '改述 / 追问 / 模板', color: 'border-yellow-300 bg-yellow-50 text-yellow-800' },
+      { key: 'qc',        icon: '✅', title: '质量检查',   subtitle: '校验 + 去重',      color: 'border-green-300 bg-green-50 text-green-800' },
+      { key: 'out',       icon: '🎯', title: '知识库入库',  subtitle: '最终 Q&A 数据集',  color: 'border-gray-300 bg-gray-50 text-gray-800' },
+    ];
+    const templates = [
+      { name: '赔付判断', tpl: '{险种}中，{场景}，能赔吗？' },
+      { name: '条款解读', tpl: '{险种}里提到"{条款}"，这具体是什么意思？' },
+      { name: '时限说明', tpl: '{险种}的{时限}是怎么计算的？超过了怎么办？' },
+      { name: '金额计算', tpl: '{险种}约定的{金额}，实际理赔时怎么算？' },
+      { name: '操作指引', tpl: '办理{险种}的{流程}需要准备什么？' },
+      { name: '除外责任', tpl: '{险种}中"{除外}"属于除外责任吗？' },
+    ];
+    const crossCount = 19;
+    const stats = reactive({ chunks: null, seeds: null, expanded: null, qc: null });
+
+    onMounted(async () => {
+      // 从 overview 拿种子数、扩展数、质检报告
+      try {
+        const r = await fetch('/api/data/reports/overview');
+        const d = await r.json();
+        stats.seeds    = d.seeds_total    || 0;
+        stats.expanded = d.expanded_total || 0;
+        stats.qc       = d.qc || null;
+      } catch {}
+      // chunk 统计：直接读 /chunks/stats，包含总数、文档数、分布
+      try {
+        const r = await fetch('/api/data/chunks/stats');
+        const d = await r.json();
+        stats.chunks = {
+          total_chunks: d.total_chunks || 0,
+          total_docs:   d.total_docs   || '?',
+          min:          d.min          || '?',
+          max:          d.max          || '?',
+          median:       d.median       || '?',
+        };
+      } catch {}
+    });
+    const dataFlow = [
+      { count: '~50+',  label: '原始文档',   color: 'text-blue-600',   op: '分块' },
+      { count: '~800',  label: 'Chunks',    color: 'text-blue-500',   op: '×8 LLM' },
+      { count: '~5万',  label: '种子 Q&A',  color: 'text-purple-600', op: '×10 扩展' },
+      { count: '~50万', label: '扩展 Q&A',  color: 'text-yellow-600', op: '质检过滤' },
+      { count: '~15万', label: '通过质检',   color: 'text-green-600',  op: '入库' },
+      { count: '~15万', label: '最终数据集', color: 'text-gray-700',   op: '' },
+    ];
+    return { steps, dataFlow, templates, crossCount, stats };
+  },
+};
+
 // ─── Root App ─────────────────────────────────────────────────────────────────
 const navItems = [
+  { key: 'guide',     label: '流程介绍', icon: '📖' },
   { key: 'documents', label: '文档上传', icon: '📁' },
   { key: 'pipeline',  label: '流水线',   icon: '⚙️'  },
   { key: 'chunks',    label: 'Chunks',   icon: '📦' },
@@ -640,6 +1426,7 @@ const navItems = [
   { key: 'reports',   label: '数据报告', icon: '📊' },
 ];
 const pages = {
+  guide:     PageGuide,
   documents: PageDocuments,
   pipeline:  PagePipeline,
   chunks:    PageChunks,
@@ -649,7 +1436,7 @@ const pages = {
 
 createApp({
   setup() {
-    const currentPage   = ref('documents');
+    const currentPage   = ref('guide');
     const pipelineStatus = reactive({ is_running: false, steps: {} });
 
     let es = null;
@@ -669,6 +1456,7 @@ createApp({
         const ev = JSON.parse(e.data);
         if (ev.type === 'init') Object.assign(pipelineStatus, ev.state);
         else if (ev.type === 'step_update') pipelineStatus.is_running = true;
+        else if (ev.type === 'pipeline_done') Object.assign(pipelineStatus, ev.state);
       };
       es.onerror = () => setTimeout(connectSSE, 5000);
     }

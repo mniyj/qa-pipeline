@@ -11,12 +11,14 @@ import json
 import re
 import argparse
 import logging
+import concurrent.futures
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 from typing import Optional
 
 import yaml
+import asyncio
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -84,13 +86,23 @@ def validate_format(qa: dict) -> dict:
 def run_format_check(qa_list: list[dict]) -> tuple[list[dict], list[dict]]:
     """批量格式校验，返回 (通过列表, 失败列表)"""
     passed, failed = [], []
-    for qa in qa_list:
+
+    def check_one(qa):
         result = validate_format(qa)
         if result["passed"]:
-            passed.append(qa)
+            return "pass", qa
         else:
             qa["_qc_issues"] = result["issues"]
-            failed.append(qa)
+            return "fail", qa
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(check_one, qa) for qa in qa_list]
+        for future in concurrent.futures.as_completed(futures):
+            status, qa = future.result()
+            if status == "pass":
+                passed.append(qa)
+            else:
+                failed.append(qa)
 
     logger.info(f"格式校验: {len(passed)} 通过, {len(failed)} 失败")
     return passed, failed
@@ -99,6 +111,33 @@ def run_format_check(qa_list: list[dict]) -> tuple[list[dict], list[dict]]:
 # ============================================================
 # Stage 2: 语义去重（基于文本相似度）
 # ============================================================
+def run_seed_dedup_filter(seed_files: list[str]) -> tuple[set, set]:
+    """
+    加载多个种子文件，运行语义去重，返回 (unique_ids, duplicate_ids)。
+    供 orchestrator 在扩展前调用，将重复种子 ID 写入过滤清单，避免浪费 LLM token。
+    """
+    all_qa: list[dict] = []
+    for f in seed_files:
+        with open(f, encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    try:
+                        all_qa.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+
+    if not all_qa:
+        return set(), set()
+
+    logger.info(f"种子前置去重: 加载 {len(all_qa)} 条种子，运行语义去重...")
+    unique, duplicates = run_dedup(all_qa)
+
+    unique_ids = {qa.get("id", "") for qa in unique if qa.get("id")}
+    duplicate_ids = {qa.get("id", "") for qa in duplicates if qa.get("id")}
+    logger.info(f"种子前置去重: 保留 {len(unique_ids)} 条唯一，过滤 {len(duplicate_ids)} 条重复")
+    return unique_ids, duplicate_ids
+
+
 def run_dedup(qa_list: list[dict], threshold: float = 0.92) -> tuple[list[dict], list[dict]]:
     """
     语义去重
@@ -153,33 +192,143 @@ def _dedup_embedding(qa_list: list[dict], threshold: float) -> tuple[list[dict],
     """
     from sentence_transformers import SentenceTransformer
     import numpy as np
+    from concurrent.futures import ThreadPoolExecutor
 
     model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
     questions = [qa.get("question", "") for qa in qa_list]
     # normalize_embeddings=True → cosine sim = dot product
-    embeddings = model.encode(questions, normalize_embeddings=True, show_progress_bar=True)
+    logger.info(f"去重(embedding): 计算 {len(questions)} 条问题的向量表示（可能需要数分钟）...")
+    # 在线程池中运行 encode，避免阻塞（SentenceTransformer 不释放 GIL，但可隔离）
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(model.encode, questions, normalize_embeddings=True, show_progress_bar=False)
+        embeddings = future.result()
+    logger.info(f"去重(embedding): 向量计算完成，开始相似度比对...")
 
-    unique_indices: list[int] = []
-    duplicate_indices: list[int] = []
+    N = len(embeddings)
+    unique_mask = np.zeros(N, dtype=bool)
+    LOG_EVERY = max(1000, N // 10)
 
-    for i in range(len(embeddings)):
-        if not unique_indices:
-            unique_indices.append(i)
+    for i in range(N):
+        if i > 0 and i % LOG_EVERY == 0:
+            logger.info(f"去重进度: {i}/{N} ({i/N:.0%})，已找到 {unique_mask.sum()} 条唯一")
+        if not unique_mask.any():
+            unique_mask[i] = True
             continue
-        # 一次 BLAS 矩阵-向量乘法替代 Python for-loop
-        unique_vecs = embeddings[unique_indices]          # (K, D) numpy slice
-        sims = unique_vecs @ embeddings[i]               # (K,) 向量化点积
+        # 向量化：一次性计算与所有唯一向量的相似度
+        # unique_vecs = embeddings[unique_mask]  # (K, D)
+        # sims = unique_vecs @ embeddings[i]  # (K,)
+        # 改用布尔掩码直接索引，避免每次创建新数组
+        sims = embeddings[unique_mask] @ embeddings[i]
         if float(sims.max()) > threshold:
-            duplicate_indices.append(i)
+            # duplicate
+            continue
         else:
-            unique_indices.append(i)
+            unique_mask[i] = True
 
+    unique_indices = np.where(unique_mask)[0].tolist()
+    duplicate_indices = np.where(~unique_mask)[0].tolist()
     unique = [qa_list[i] for i in unique_indices]
     duplicates = [qa_list[i] for i in duplicate_indices]
     for d in duplicates:
         d["_qc_issues"] = d.get("_qc_issues", []) + ["语义重复"]
 
     logger.info(f"去重(embedding): {len(unique)} 唯一, {len(duplicates)} 重复")
+    return unique, duplicates
+
+
+def run_dedup_incremental(
+    new_qa: list[dict],
+    baseline_qa: list[dict],
+    threshold: float = 0.92,
+) -> tuple[list[dict], list[dict]]:
+    """增量去重：检查 new_qa 与 baseline_qa 及 new_qa 内部是否重复。
+    baseline_qa 已去重，直接作为"已见"基准，不出现在返回值中。
+    """
+    if not new_qa:
+        return [], []
+    logger.info(f"增量去重: {len(new_qa)} 条新 Q&A，基准 {len(baseline_qa)} 条...")
+    try:
+        return _dedup_embedding_incremental(new_qa, baseline_qa, threshold)
+    except ImportError:
+        logger.warning("sentence-transformers 不可用，使用 n-gram 增量去重")
+        return _dedup_ngram_incremental(new_qa, baseline_qa, threshold=0.7)
+
+
+def _dedup_ngram_incremental(
+    new_qa: list[dict],
+    baseline_qa: list[dict],
+    threshold: float = 0.7,
+) -> tuple[list[dict], list[dict]]:
+    def ngrams(text: str, n: int = 3) -> set:
+        return set(text[i:i+n] for i in range(len(text) - n + 1))
+
+    def jaccard(a: set, b: set) -> float:
+        if not a or not b:
+            return 0.0
+        return len(a & b) / len(a | b)
+
+    seen_ngrams = [ngrams(qa.get("question", "")) for qa in baseline_qa]
+    unique, duplicates = [], []
+    for qa in new_qa:
+        q_ng = ngrams(qa.get("question", ""))
+        is_dup = any(jaccard(q_ng, existing) > threshold for existing in seen_ngrams)
+        if is_dup:
+            qa["_qc_issues"] = qa.get("_qc_issues", []) + ["语义重复"]
+            duplicates.append(qa)
+        else:
+            unique.append(qa)
+            seen_ngrams.append(q_ng)
+    logger.info(f"增量去重(n-gram): {len(unique)} 唯一, {len(duplicates)} 重复")
+    return unique, duplicates
+
+
+def _dedup_embedding_incremental(
+    new_qa: list[dict],
+    baseline_qa: list[dict],
+    threshold: float,
+) -> tuple[list[dict], list[dict]]:
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+    from concurrent.futures import ThreadPoolExecutor
+
+    model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+    new_questions = [qa.get("question", "") for qa in new_qa]
+
+    logger.info(f"增量去重(embedding): 计算 {len(new_questions)} 条新问题向量...")
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        new_embs = executor.submit(
+            model.encode, new_questions, normalize_embeddings=True, show_progress_bar=False,
+        ).result()
+
+    if baseline_qa:
+        baseline_questions = [qa.get("question", "") for qa in baseline_qa]
+        logger.info(f"增量去重(embedding): 计算 {len(baseline_questions)} 条基准问题向量...")
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            base_embs = executor.submit(
+                model.encode, baseline_questions, normalize_embeddings=True, show_progress_bar=False,
+            ).result()
+        unique_embs = list(base_embs)
+    else:
+        unique_embs = []
+
+    unique, duplicates = [], []
+    LOG_EVERY = max(500, len(new_qa) // 10)
+    for i, (qa, emb) in enumerate(zip(new_qa, new_embs)):
+        if i > 0 and i % LOG_EVERY == 0:
+            logger.info(f"增量去重进度: {i}/{len(new_qa)} ({i/len(new_qa):.0%})")
+        if not unique_embs:
+            unique.append(qa)
+            unique_embs.append(emb)
+            continue
+        sims = np.stack(unique_embs) @ emb
+        if float(sims.max()) > threshold:
+            qa["_qc_issues"] = qa.get("_qc_issues", []) + ["语义重复"]
+            duplicates.append(qa)
+        else:
+            unique.append(qa)
+            unique_embs.append(emb)
+
+    logger.info(f"增量去重(embedding): {len(unique)} 唯一, {len(duplicates)} 重复")
     return unique, duplicates
 
 
@@ -213,16 +362,39 @@ def run_fact_check(qa_list: list[dict]) -> tuple[list[dict], list[dict]]:
     """规则引擎事实校验"""
     passed, flagged = [], []
 
-    for qa in qa_list:
+    def check_one(qa):
         issues = _check_facts(qa)
         if issues:
             qa["_fact_issues"] = issues
-            flagged.append(qa)
-        else:
-            passed.append(qa)
+            return "flag", qa
+        return "pass", qa
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(check_one, qa) for qa in qa_list]
+        for future in concurrent.futures.as_completed(futures):
+            status, qa = future.result()
+            if status == "pass":
+                passed.append(qa)
+            else:
+                flagged.append(qa)
 
     logger.info(f"事实校验: {len(passed)} 通过, {len(flagged)} 存疑")
     return passed, flagged
+
+
+def _quick_report(qa_list: list[dict], output_path: Path, config: dict) -> dict:
+    """为全跳过场景生成快速报告"""
+    coverage_report = run_coverage_analysis(qa_list, config)
+    return {
+        "qc_time": datetime.now().isoformat(),
+        "input_total": len(qa_list),
+        "passed_total": len(qa_list),
+        "rejected_total": 0,
+        "pass_rate": "100.0%",
+        "stage_stats": {},
+        "coverage": coverage_report,
+        "skipped_all": True,
+    }
 
 
 def _parse_yuan(text: str) -> list[int]:
@@ -275,13 +447,7 @@ def run_coverage_analysis(qa_list: list[dict], config: dict) -> dict:
     """分析知识坐标覆盖情况"""
     schema = config.get("knowledge_schema", {})
 
-    # 收集所有险种（展平嵌套结构）
-    all_types = []
-    for category, subtypes in schema.get("insurance_types", {}).items():
-        if isinstance(subtypes, list):
-            all_types.extend(subtypes)
-        else:
-            all_types.append(category)
+    all_types = schema.get("insurance_types", [])
 
     stages = schema.get("business_stages", [])
     qtypes = schema.get("question_types", [])
@@ -345,81 +511,143 @@ def run_full_qc(
     output_dir: str,
     config: dict,
     stages: str = "format,dedup,fact,coverage",
+    progress_callback=None,
 ) -> dict:
-    """运行完整的质检管道"""
+    """增量质检管道：只对新增/变化的文件做 format/dedup/fact，已通过的数据不重复处理。"""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # 加载所有 Q&A
-    all_qa = []
-    for f in input_files:
-        with open(f, "r", encoding="utf-8") as fh:
+    # 加载已质检文件清单（filepath → mtime）
+    qc_manifest_file = output_path / "qc_manifest.json"
+    qc_manifest: dict[str, str] = {}
+    if qc_manifest_file.exists():
+        with open(qc_manifest_file, "r", encoding="utf-8") as f:
+            qc_manifest = json.load(f)
+
+    # 找出新增或有变化的文件
+    pending_files = []
+    for fp in input_files:
+        fpath = Path(fp)
+        if not fpath.exists():
+            continue
+        mtime = str(fpath.stat().st_mtime)
+        if qc_manifest.get(str(fpath)) == mtime:
+            logger.info(f"跳过（已质检无变化）: {fpath.name}")
+        else:
+            pending_files.append(fp)
+
+    # 加载已通过质检的历史数据（作为去重基准，不再重新校验）
+    passed_file = output_path / "qa_passed.jsonl"
+    existing_passed: list[dict] = []
+    if passed_file.exists():
+        with open(passed_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    existing_passed.append(json.loads(line))
+
+    if not pending_files:
+        if existing_passed:
+            logger.info(f"所有文件已质检且无变化，当前累计通过 {len(existing_passed)} 条")
+            return _quick_report(existing_passed, output_path, config)
+        logger.info("没有待质检的文件")
+        return {"input_total": 0, "passed_total": 0, "rejected_total": 0}
+
+    # 仅加载新文件的条目
+    new_qa: list[dict] = []
+    for fp in pending_files:
+        before = len(new_qa)
+        with open(fp, "r", encoding="utf-8") as fh:
             for line in fh:
                 if line.strip():
-                    all_qa.append(json.loads(line))
+                    new_qa.append(json.loads(line))
+        logger.info(f"  载入 {Path(fp).name}: +{len(new_qa) - before} 条")
 
-    logger.info(f"加载 {len(all_qa)} 条 Q&A，开始质检")
+    logger.info(
+        f"加载完成: 新增 {len(new_qa)} 条（{len(pending_files)} 个文件），"
+        f"已有历史 {len(existing_passed)} 条，开始增量质检"
+    )
+
     stages_list = [s.strip() for s in stages.split(",")]
-
-    current = all_qa
-    all_rejected = []
+    current = new_qa
+    new_rejected: list[dict] = []
     stage_stats = {}
+    _stage_weights = {"format": 25, "dedup": 50, "fact": 75, "coverage": 90}
+    _progress_done = 0
 
-    # Stage 1: 格式校验
+    def _report_stage(name: str):
+        nonlocal _progress_done
+        _progress_done = _stage_weights.get(name, _progress_done)
+        if progress_callback:
+            progress_callback(_progress_done, 100)
+
+    # Stage 1: 格式校验（仅对新条目）
     if "format" in stages_list:
         current, rejected = run_format_check(current)
-        all_rejected.extend(rejected)
+        new_rejected.extend(rejected)
         stage_stats["format"] = {"passed": len(current), "rejected": len(rejected)}
+        _report_stage("format")
 
-    # Stage 2: 去重
+    # Stage 2: 增量去重（新条目 vs 历史基准 + 新条目内部）
     if "dedup" in stages_list:
-        current, rejected = run_dedup(current)
-        all_rejected.extend(rejected)
+        current, rejected = run_dedup_incremental(current, existing_passed)
+        new_rejected.extend(rejected)
         stage_stats["dedup"] = {"passed": len(current), "rejected": len(rejected)}
+        _report_stage("dedup")
 
-    # Stage 3: 事实校验
+    # Stage 3: 事实校验（仅对新条目）
     if "fact" in stages_list:
         current, flagged = run_fact_check(current)
-        all_rejected.extend(flagged)
+        new_rejected.extend(flagged)
         stage_stats["fact"] = {"passed": len(current), "flagged": len(flagged)}
+        _report_stage("fact")
 
-    # Stage 4: 覆盖率分析
-    coverage_report = {}
-    if "coverage" in stages_list:
-        coverage_report = run_coverage_analysis(current, config)
-        stage_stats["coverage"] = {
-            "gaps": coverage_report.get("gap_count", 0),
-            "weak": coverage_report.get("weak_count", 0),
-        }
-
-    # 保存通过质检的 Q&A
-    passed_file = output_path / "qa_passed.jsonl"
-    with open(passed_file, "w", encoding="utf-8") as f:
+    # 将新通过的条目追加写入 qa_passed.jsonl
+    with open(passed_file, "a", encoding="utf-8") as f:
         for qa in current:
-            # 清除内部标记
             qa.pop("_qc_issues", None)
             qa.pop("_fact_issues", None)
             f.write(json.dumps(qa, ensure_ascii=False) + "\n")
 
-    # 保存被拒绝的
+    all_passed = existing_passed + current
+
+    # Stage 4: 覆盖率分析（基于全量通过数据）
+    coverage_report = {}
+    if "coverage" in stages_list:
+        coverage_report = run_coverage_analysis(all_passed, config)
+        stage_stats["coverage"] = {
+            "gaps": coverage_report.get("gap_count", 0),
+            "weak": coverage_report.get("weak_count", 0),
+        }
+        _report_stage("coverage")
+
+    # 更新质检清单
+    for fp in pending_files:
+        fpath = Path(fp)
+        qc_manifest[str(fpath)] = str(fpath.stat().st_mtime)
+    with open(qc_manifest_file, "w", encoding="utf-8") as f:
+        json.dump(qc_manifest, f, ensure_ascii=False, indent=2)
+
+    # 将本次被拒绝的条目追加写入 qa_rejected.jsonl
     rejected_file = output_path / "qa_rejected.jsonl"
-    with open(rejected_file, "w", encoding="utf-8") as f:
-        for qa in all_rejected:
+    with open(rejected_file, "a", encoding="utf-8") as f:
+        for qa in new_rejected:
             f.write(json.dumps(qa, ensure_ascii=False) + "\n")
 
-    # 综合报告
+    input_total = len(existing_passed) + len(new_qa)
     report = {
         "qc_time": datetime.now().isoformat(),
-        "input_total": len(all_qa),
-        "passed_total": len(current),
-        "rejected_total": len(all_rejected),
-        "pass_rate": f"{len(current)/max(len(all_qa),1):.1%}",
+        "input_total": input_total,
+        "new_input": len(new_qa),
+        "passed_total": len(all_passed),
+        "passed_new": len(current),
+        "rejected_total": len(new_rejected),
+        "pass_rate": f"{len(all_passed)/max(input_total, 1):.1%}",
         "stage_stats": stage_stats,
         "coverage": coverage_report,
         "output_files": {
             "passed": str(passed_file),
             "rejected": str(rejected_file),
-        }
+        },
     }
 
     report_file = output_path / "qc_report.json"
@@ -427,10 +655,11 @@ def run_full_qc(
         json.dump(report, f, ensure_ascii=False, indent=2)
 
     logger.info("=" * 50)
-    logger.info("质检完成")
-    logger.info(f"  输入: {len(all_qa)} 条")
-    logger.info(f"  通过: {len(current)} 条 ({len(current)/max(len(all_qa),1):.1%})")
-    logger.info(f"  拒绝: {len(all_rejected)} 条")
+    logger.info("增量质检完成")
+    logger.info(f"  本次新增输入: {len(new_qa)} 条")
+    logger.info(f"  本次新增通过: {len(current)} 条")
+    logger.info(f"  本次新增拒绝: {len(new_rejected)} 条")
+    logger.info(f"  累计通过: {len(all_passed)} 条 ({len(all_passed)/max(input_total, 1):.1%})")
     logger.info(f"  报告: {report_file}")
     logger.info("=" * 50)
 

@@ -52,12 +52,13 @@ def load_config(path: str = "./config/config.yaml") -> dict:
 # ============================================================
 # Step 1: 文档预处理
 # ============================================================
-def cmd_preprocess(config: dict):
+def cmd_preprocess(config: dict, progress_callback=None):
     paths = config["storage"]["paths"]
     report = process_all_documents(
         paths["raw_documents"],
         paths["chunks"],
         config,
+        progress_callback=progress_callback,
     )
     return report
 
@@ -65,7 +66,7 @@ def cmd_preprocess(config: dict):
 # ============================================================
 # Step 2: 种子生成
 # ============================================================
-def cmd_seed(config: dict, limit: int = None, pairs: int = 8):
+def cmd_seed(config: dict, limit: int = None, pairs: int = 8, progress_callback=None):
     paths = config["storage"]["paths"]
     chunks_file = Path(paths["chunks"]) / "chunks.jsonl"
 
@@ -79,14 +80,81 @@ def cmd_seed(config: dict, limit: int = None, pairs: int = 8):
         config,
         limit=limit,
         pairs_per_chunk=pairs,
+        progress_callback=progress_callback,
     )
     return report
 
 
 # ============================================================
+# Step 2b: 种子前置去重（在扩展前消除重复，节省 LLM token）
+# ============================================================
+def cmd_seed_dedup(config: dict, progress_callback=None) -> dict:
+    """
+    对所有种子文件做语义去重（embedding，无 LLM 调用），
+    将重复种子 ID 写入 expanded/seed_dedup_filter.json。
+    cmd_expand() 读取此文件跳过重复种子，避免浪费 token。
+    """
+    paths = config["storage"]["paths"]
+    from quality_checker import run_seed_dedup_filter
+
+    def _progress(pct: int):
+        if progress_callback:
+            progress_callback(pct, 100)
+
+    seed_files = sorted(glob.glob(f"{paths['seeds']}/*.jsonl"))
+    seed_files = [f for f in seed_files if not f.endswith("_report.json")]
+    if not seed_files:
+        logger.warning("没有种子文件可去重，跳过")
+        return {}
+
+    expanded_dir = Path(paths["expanded"])
+    expanded_dir.mkdir(parents=True, exist_ok=True)
+
+    # 检查种子文件自上次去重后是否有变化
+    state_file  = expanded_dir / "seed_dedup_state.json"
+    filter_file = expanded_dir / "seed_dedup_filter.json"
+    current_state = {str(Path(f).resolve()): str(Path(f).stat().st_mtime) for f in seed_files}
+    if state_file.exists() and filter_file.exists():
+        with open(state_file, encoding="utf-8") as f:
+            prev_state = json.load(f)
+        if prev_state == current_state:
+            with open(filter_file, encoding="utf-8") as f:
+                skip_ids = json.load(f)
+            logger.info(f"种子前置去重: 种子文件无变化，复用已有过滤清单（{len(skip_ids)} 条重复）")
+            return {"skipped": True, "duplicate_count": len(skip_ids)}
+
+    _progress(20)  # 文件状态检查完成
+    unique_ids, duplicate_ids = run_seed_dedup_filter(seed_files)
+    _progress(80)  # embedding 计算完成
+
+    with open(filter_file, "w", encoding="utf-8") as f:
+        json.dump(list(duplicate_ids), f, ensure_ascii=False)
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump(current_state, f, ensure_ascii=False, indent=2)
+
+    logger.info(
+        f"种子前置去重完成: 共 {len(unique_ids)+len(duplicate_ids)} 条 → "
+        f"保留 {len(unique_ids)} 条，跳过 {len(duplicate_ids)} 条重复"
+    )
+    return {
+        "total": len(unique_ids) + len(duplicate_ids),
+        "unique": len(unique_ids),
+        "duplicates": len(duplicate_ids),
+    }
+
+
+# ============================================================
 # Step 3: 批量扩展
 # ============================================================
-def cmd_expand(config: dict, seed_file: str = None, limit: int = None):
+def _stop_requested() -> bool:
+    try:
+        from src.pipeline_state import pipeline_state
+        return pipeline_state.is_stop_requested()
+    except Exception:
+        return False
+
+
+def cmd_expand(config: dict, seed_file: str = None, limit: int = None, progress_callback=None):
     paths = config["storage"]["paths"]
 
     # 找到种子文件
@@ -99,6 +167,14 @@ def cmd_expand(config: dict, seed_file: str = None, limit: int = None):
     if not seed_files:
         logger.error("没有找到种子文件，请先运行 seed")
         return
+
+    # 加载种子前置去重过滤器（由 cmd_seed_dedup 生成）
+    seed_filter_file = Path(paths["expanded"]) / "seed_dedup_filter.json"
+    seed_skip_ids: set[str] = set()
+    if seed_filter_file.exists():
+        with open(seed_filter_file, encoding="utf-8") as f:
+            seed_skip_ids = set(json.load(f))
+        logger.info(f"已加载种子去重过滤器: {len(seed_skip_ids)} 条重复种子将跳过（节省约 {len(seed_skip_ids)*5} 次 LLM 调用）")
 
     # 加载已扩展的种子文件清单
     expanded_manifest_file = Path(paths["expanded"]) / "expanded_seeds.json"
@@ -114,33 +190,78 @@ def cmd_expand(config: dict, seed_file: str = None, limit: int = None):
         f"待扩展 {len(new_seed_files)} 个"
     )
 
+    # 预计算总种子数（用于进度计算）
+    _total_expand_seeds = 0
+    if progress_callback:
+        for sf in new_seed_files:
+            s = load_seeds(sf)
+            if seed_skip_ids:
+                s = [x for x in s if x.get("id", "") not in seed_skip_ids]
+            _total_expand_seeds += len(s)
+    _expand_offset = 0
+
     for sf in new_seed_files:
+        if _stop_requested():
+            logger.warning("⏹️ 收到停止请求，扩展步骤终止")
+            break
+
         seeds = load_seeds(sf)
         if not seeds:
             expanded_manifest.append(sf)
             continue
 
-        logger.info(f"处理种子文件: {sf} ({len(seeds)} 条)")
+        # 应用前置去重过滤器
+        if seed_skip_ids:
+            before = len(seeds)
+            seeds = [s for s in seeds if s.get("id", "") not in seed_skip_ids]
+            filtered = before - len(seeds)
+            if filtered:
+                logger.info(f"  前置去重过滤: {Path(sf).name} 原 {before} 条 → 保留 {len(seeds)} 条（跳过 {filtered} 条）")
 
-        # 3.1 改述变体
+        if not seeds:
+            expanded_manifest.append(sf)
+            continue
+
+        logger.info(f"处理种子文件: {sf} ({len(seeds)} 条)")
+        n = len(seeds)
+        total2 = _total_expand_seeds * 2  # rephrase + followup
+
+        def _make_cb(base_offset):
+            def cb(done, _total):
+                if progress_callback and total2 > 0:
+                    progress_callback(base_offset + done, total2)
+            return cb
+
+        # 3.1 改述变体（占 0→50% 区间）
         logger.info("--- 开始改述扩展 ---")
         expand_rephrase(
             seeds, config, paths["expanded"],
             num_variants=config["generation"]["expansion"]["rephrase_variants"],
             limit=limit,
+            progress_callback=_make_cb(_expand_offset),
         )
+        if _stop_requested():
+            logger.warning("⏹️ 收到停止请求，扩展步骤终止")
+            break
 
-        # 3.2 追问链
+        # 3.2 追问链（占 50→100% 区间）
         logger.info("--- 开始追问链扩展 ---")
         expand_followup(
             seeds, config, paths["expanded"],
             chain_length=config["generation"]["expansion"]["follow_up_depth"],
             limit=limit,
+            progress_callback=_make_cb(_expand_offset + _total_expand_seeds),
         )
 
-        expanded_manifest.append(sf)
+        _expand_offset += n
 
-    # 更新清单
+        expanded_manifest.append(sf)
+        # 每完成一个文件立即写入清单，防止中途崩溃丢失进度
+        Path(paths["expanded"]).mkdir(parents=True, exist_ok=True)
+        with open(expanded_manifest_file, "w", encoding="utf-8") as f:
+            json.dump(expanded_manifest, f, ensure_ascii=False, indent=2)
+
+    # 确保最终清单存在（循环提前退出时也要写入）
     Path(paths["expanded"]).mkdir(parents=True, exist_ok=True)
     with open(expanded_manifest_file, "w", encoding="utf-8") as f:
         json.dump(expanded_manifest, f, ensure_ascii=False, indent=2)
@@ -149,26 +270,29 @@ def cmd_expand(config: dict, seed_file: str = None, limit: int = None):
 # ============================================================
 # Step 4: 质检
 # ============================================================
-def cmd_qc(config: dict, input_files: list[str] = None):
+def cmd_qc(config: dict, input_files: list[str] = None, progress_callback=None):
     paths = config["storage"]["paths"]
 
     if input_files:
         files = input_files
     else:
-        # 收集所有种子 + 扩展的 JSONL 文件
         files = sorted(glob.glob(f"{paths['seeds']}/*.jsonl"))
         files += sorted(glob.glob(f"{paths['expanded']}/*.jsonl"))
-        # 排除报告文件
         files = [f for f in files if not f.endswith("_report.json")]
 
     if not files:
         logger.error("没有找到待质检的文件")
         return
 
+    if _stop_requested():
+        logger.warning("⏹️ 收到停止请求，跳过质检")
+        return
+
     report = run_full_qc(
         files,
         paths.get("qc_results", "./data/qc_results"),
         config,
+        progress_callback=progress_callback,
     )
     return report
 
@@ -265,6 +389,10 @@ def cmd_run(config: dict, seed_limit: int = None, expand_limit: int = None):
     logger.info("=" * 40 + " Step 2: 种子生成 " + "=" * 40)
     cmd_seed(config, limit=seed_limit)
 
+    # Step 2b: 种子前置去重（节省扩展 token）
+    logger.info("=" * 40 + " Step 2b: 种子前置去重 " + "=" * 40)
+    cmd_seed_dedup(config)
+
     # Step 3a: 改述 + 追问链扩展（基于种子文件）
     logger.info("=" * 40 + " Step 3a: 改述/追问链扩展 " + "=" * 40)
     cmd_expand(config, limit=expand_limit)
@@ -299,13 +427,14 @@ def main():
   python src/orchestrator.py preprocess           # 预处理文档
   python src/orchestrator.py seed --limit 5       # 试跑5个chunk的种子生成
   python src/orchestrator.py seed                 # 全量种子生成
-  python src/orchestrator.py expand               # 批量扩展
+  python src/orchestrator.py seed-dedup           # 种子前置去重（节省扩展 token）
+  python src/orchestrator.py expand               # 批量扩展（自动使用去重过滤器）
   python src/orchestrator.py qc                   # 质检
   python src/orchestrator.py run                  # 全流程
   python src/orchestrator.py run --seed-limit 3   # 全流程试跑
         """
     )
-    parser.add_argument("command", choices=["run", "preprocess", "seed", "expand", "expand-template", "qc", "status"])
+    parser.add_argument("command", choices=["run", "preprocess", "seed", "seed-dedup", "expand", "expand-template", "qc", "status"])
     parser.add_argument("--config", default="./config/config.yaml")
     parser.add_argument("--limit", type=int, default=None, help="限制处理数量")
     parser.add_argument("--seed-limit", type=int, default=None, help="种子阶段限制chunk数")
@@ -323,6 +452,8 @@ def main():
         cmd_preprocess(config)
     elif args.command == "seed":
         cmd_seed(config, limit=args.limit or args.seed_limit, pairs=args.pairs)
+    elif args.command == "seed-dedup":
+        cmd_seed_dedup(config)
     elif args.command == "expand":
         cmd_expand(config, seed_file=args.seed_file, limit=args.limit or args.expand_limit)
     elif args.command == "expand-template":

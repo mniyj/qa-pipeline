@@ -1,0 +1,51 @@
+{
+  "current_step": null,
+  "is_running": false,
+  "steps": {
+    "preprocess": {
+      "key": "preprocess",
+      "label": "文档预处理",
+      "status": "done",
+      "progress": 100,
+      "message": "",
+      "output_count": 0,
+      "error": ""
+    },
+    "seed": {
+      "key": "seed",
+      "label": "种子生成",
+      "status": "done",
+      "progress": 100,
+      "message": "",
+      "output_count": 0,
+      "error": ""
+    },
+    "seed_dedup": {
+      "key": "seed_dedup",
+      "label": "种子去重",
+      "status": "done",
+      "progress": 100,
+      "message": "过滤 26030 条重复种子",
+      "output_count": 25738,
+      "error": ""
+    },
+    "expand": {
+      "key": "expand",
+      "label": "批量扩展",
+      "status": "done",
+      "progress": 100,
+      "message": "",
+      "output_count": 4062,
+      "error": ""
+    },
+    "qc": {
+      "key": "qc",
+      "label": "质量检查",
+      "status": "done",
+      "progress": 100,
+      "message": "",
+      "output_count": 31964,
+      "error": ""
+    }
+  }
+}
