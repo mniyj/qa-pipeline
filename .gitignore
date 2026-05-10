@@ -6,6 +6,8 @@ data/raw_documents/*
 !data/raw_documents/.gitkeep
 !data/raw_documents/保险相关文件/
 !data/raw_documents/保险相关文件/*
+!data/raw_documents/laws/
+!data/raw_documents/laws/*
 data/chunks/*
 !data/chunks/.gitkeep
 data/seeds/*
@@ -14,5 +16,6 @@ data/expanded/*
 !data/expanded/.gitkeep
 data/qc_results/*
 !data/qc_results/.gitkeep
+!data/qc_results/qa_passed.csv
 data/final/*
 !data/final/.gitkeep
