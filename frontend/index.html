@@ -64,115 +64,363 @@
 <script>
 const { createApp, ref, reactive, onMounted, onUnmounted, nextTick, computed, watch } = Vue;
 
+// ─── API helpers ─────────────────────────────────────────────────────────────
+const API_BASE_CANDIDATES = (() => {
+  const list = [];
+  if (window.location.origin && window.location.origin !== 'null') {
+    list.push(window.location.origin);
+  }
+  const host = window.location.hostname || '127.0.0.1';
+  list.push(`http://${host}:8000`);
+  if (host !== '127.0.0.1') list.push('http://127.0.0.1:8000');
+  if (host !== 'localhost') list.push('http://localhost:8000');
+  return [...new Set(list)];
+})();
+
+let resolvedApiBase = null;
+
+async function apiFetch(path, options) {
+  const candidates = resolvedApiBase ? [resolvedApiBase, ...API_BASE_CANDIDATES] : API_BASE_CANDIDATES;
+  let lastError = null;
+  let lastResponse = null;
+
+  for (const base of [...new Set(candidates)]) {
+    try {
+      const res = await fetch(base + path, options);
+      if (!res.ok) {
+        lastResponse = res;
+        lastError = new Error(`HTTP ${res.status} @ ${base}${path}`);
+        continue;
+      }
+
+      const contentType = (res.headers.get('content-type') || '').toLowerCase();
+      const isExpectedApiResponse =
+        contentType.includes('application/json') ||
+        contentType.includes('application/problem+json') ||
+        contentType.includes('text/event-stream');
+
+      // Some static/dev servers return index.html for /api/* with HTTP 200.
+      // Treat HTML as a failed probe and keep trying other API base candidates.
+      if (!isExpectedApiResponse) {
+        lastResponse = res;
+        lastError = new Error(`Unexpected content-type ${contentType || '(empty)'} @ ${base}${path}`);
+        continue;
+      }
+
+      resolvedApiBase = base;
+      return res;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  if (lastResponse) return lastResponse;
+  throw lastError || new Error(`API request failed: ${path}`);
+}
+
+function apiUrl(path) {
+  const base = resolvedApiBase || API_BASE_CANDIDATES[0] || '';
+  return base + path;
+}
+
 // ─── Page: Documents ──────────────────────────────────────────────────────────
 const PageDocuments = {
   template: `
     <div>
-      <h2 class="text-base font-semibold mb-4">文档管理</h2>
+      <h2 class="text-base font-semibold mb-3">文档管理</h2>
 
-      <div @dragover.prevent @drop.prevent="onDrop"
-           @click="$refs.fi.click()"
-           class="border-2 border-dashed border-blue-200 rounded-xl p-10 text-center cursor-pointer hover:bg-blue-50 hover:border-blue-400 transition mb-5">
-        <div class="text-3xl mb-2">📄</div>
-        <p class="text-blue-500 font-medium">点击或拖拽文件上传</p>
-        <p class="text-gray-400 text-xs mt-1">支持 PDF / DOCX / TXT / MD</p>
+      <!-- Upload zone -->
+      <div @dragover.prevent="uploadHover=true" @dragleave="uploadHover=false"
+           @drop.prevent="onFileDrop" @click="$refs.fi.click()"
+           :class="['border-2 border-dashed rounded-xl p-5 text-center cursor-pointer transition mb-3',
+                    uploadHover ? 'border-blue-400 bg-blue-50' : 'border-blue-200 hover:border-blue-300 hover:bg-blue-50/50']">
+        <div class="text-2xl mb-1">📄</div>
+        <p class="text-blue-500 font-medium text-sm">点击或拖拽文件上传</p>
+        <p class="text-gray-400 text-xs mt-0.5">上传至：
+          <span class="font-medium text-blue-600">{{ activeFolder ? activeFolder + '/' : '根目录 /' }}</span>
+          <span class="text-gray-300 ml-1">（点击树中文件夹图标可切换）</span>
+        </p>
+        <p class="text-gray-300 text-xs">支持 PDF / DOCX / TXT / MD</p>
         <input ref="fi" type="file" multiple accept=".pdf,.docx,.doc,.txt,.md" class="hidden" @change="onSelect" />
       </div>
 
-      <div v-if="uploading" class="mb-3 flex items-center gap-2 text-blue-500 text-xs">
-        <span class="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin"></span>
-        上传中…
+      <div v-if="uploading" class="mb-2 flex items-center gap-2 text-blue-500 text-xs">
+        <span class="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin"></span>上传中…
       </div>
 
-      <div class="text-xs text-gray-400 mb-3">共 {{ result.total.toLocaleString() }} 个文件</div>
+      <!-- Toolbar -->
+      <div class="flex gap-2 mb-3">
+        <input v-model="search" @input="onSearchInput" @keyup.enter="loadTree"
+               placeholder="搜索文件名…" class="border rounded px-3 py-1.5 text-xs flex-1" />
+        <button v-if="search" @click="search='';loadTree()"
+                class="px-2 py-1.5 border rounded text-xs text-gray-400 hover:bg-gray-50">✕</button>
+        <button @click="beginNewFolder('')"
+                class="px-3 py-1.5 bg-green-600 text-white rounded text-xs hover:bg-green-700 transition">＋ 新建文件夹</button>
+      </div>
 
-      <div v-if="result.items.length" class="bg-white border rounded-xl overflow-hidden mb-4">
-        <table class="w-full">
-          <thead class="bg-gray-50 text-gray-500 text-xs border-b">
-            <tr>
-              <th class="text-left px-4 py-2 font-medium">文件名</th>
-              <th class="text-left px-4 py-2 font-medium w-24">大小</th>
-              <th class="px-4 py-2 w-16"></th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="f in result.items" :key="f.relative_path" class="border-b last:border-0 hover:bg-gray-50">
-              <td class="px-4 py-2.5 text-gray-700">{{ f.name }}</td>
-              <td class="px-4 py-2.5 text-gray-400 text-xs">{{ fmtSize(f.size) }}</td>
-              <td class="px-4 py-2.5 text-center">
-                <button @click.stop="del(f.relative_path)"
-                        class="text-red-300 hover:text-red-500 transition text-xs">删除</button>
-              </td>
-            </tr>
-          </tbody>
-        </table>
+      <!-- Tree panel -->
+      <div class="bg-white border rounded-xl overflow-hidden select-none">
 
-        <!-- Pagination -->
-        <div class="flex items-center gap-2 px-4 py-3 border-t text-xs flex-wrap">
-          <button @click="load(1)" :disabled="result.page<=1"
-                  class="px-2 py-1.5 border rounded disabled:opacity-30 hover:bg-gray-50 transition">«</button>
-          <button @click="load(result.page-1)" :disabled="result.page<=1"
-                  class="px-3 py-1.5 border rounded disabled:opacity-30 hover:bg-gray-50 transition">‹ 上一页</button>
-          <span class="text-gray-500">
-            第 <input type="number" v-model.number="jumpPage" @keyup.enter="goPage(jumpPage)"
-                      class="w-12 border rounded px-1 py-0.5 text-center text-xs" :min="1" :max="result.pages" />
-            / {{ result.pages }} 页
-          </span>
-          <button @click="load(result.page+1)" :disabled="result.page>=result.pages"
-                  class="px-3 py-1.5 border rounded disabled:opacity-30 hover:bg-gray-50 transition">下一页 ›</button>
-          <button @click="load(result.pages)" :disabled="result.page>=result.pages"
-                  class="px-2 py-1.5 border rounded disabled:opacity-30 hover:bg-gray-50 transition">»</button>
+        <!-- Root drop-zone header -->
+        <div @dragover.prevent="dragTarget='__root__'" @dragleave="dragTarget=null"
+             @drop.prevent="dropOnFolder('')"
+             :class="['flex items-center gap-1.5 px-3 py-2 text-xs border-b transition',
+                      dragTarget==='__root__' ? 'bg-blue-50 border-blue-300' : 'bg-gray-50']">
+          <span class="text-gray-400">📂</span>
+          <span class="text-gray-500 font-medium">根目录 /</span>
+          <span v-if="dragTarget==='__root__'" class="text-blue-500 ml-1">松开以移动到此处</span>
+          <span class="ml-auto text-gray-400">{{ totalFiles }} 个文件</span>
+        </div>
+
+        <!-- New folder input at root level -->
+        <div v-if="newFolderParent==='' && newFolderVisible"
+             class="flex items-center gap-2 px-3 py-1.5 bg-green-50 border-b">
+          <span>📁</span>
+          <input ref="nfi" v-model="newFolderName" @keyup.enter="confirmNewFolder" @keyup.esc="cancelNewFolder"
+                 class="border rounded px-2 py-0.5 text-xs flex-1" placeholder="新文件夹名…" autofocus />
+          <button @click="confirmNewFolder" class="text-green-600 text-xs px-1 hover:text-green-800">✓ 确认</button>
+          <button @click="cancelNewFolder" class="text-gray-400 text-xs px-1 hover:text-gray-600">✗</button>
+        </div>
+
+        <div v-if="loading" class="py-10 text-center text-gray-400 text-sm">加载中…</div>
+        <div v-else-if="!flatNodes.length" class="py-10 text-center text-gray-400 text-sm">
+          {{ search ? '无匹配文件' : '暂无文档，请上传文件' }}
+        </div>
+
+        <div v-else>
+          <template v-for="node in flatNodes" :key="node.path">
+
+            <!-- Folder row -->
+            <template v-if="node.type==='folder'">
+              <div @dragover.prevent="dragTarget=node.path" @dragleave="dragTarget=null"
+                   @drop.prevent="dropOnFolder(node.path)"
+                   :class="['flex items-center gap-1.5 border-b text-xs py-1.5 pr-2 transition cursor-pointer',
+                            dragTarget===node.path ? 'bg-blue-50' : 'hover:bg-gray-50']"
+                   :style="{paddingLeft: (node.depth*16+10)+'px'}">
+                <button @click="toggleFolder(node.path)" class="text-gray-400 w-4 flex-shrink-0 hover:text-gray-600">
+                  {{ expanded.has(node.path) ? '▾' : '▸' }}
+                </button>
+                <button @click="setActiveFolder(node.path)"
+                        :class="['text-lg leading-none flex-shrink-0', activeFolder===node.path ? 'grayscale-0' : 'grayscale']"
+                        title="设为上传目标文件夹">📁</button>
+                <span @click="toggleFolder(node.path)" class="font-medium text-gray-700 flex-1">{{ node.name }}/</span>
+                <span v-if="dragTarget===node.path" class="text-blue-500 mr-1">拖放至此</span>
+                <button @click.stop="beginNewFolder(node.path)"
+                        class="text-green-500 hover:text-green-700 px-1" title="在此文件夹下新建子文件夹">＋</button>
+                <button @click.stop="delFolder(node.path)"
+                        class="text-red-300 hover:text-red-500 px-1" title="删除文件夹（含内容）">🗑</button>
+              </div>
+              <!-- Inline new-subfolder input -->
+              <div v-if="newFolderParent===node.path && newFolderVisible"
+                   class="flex items-center gap-2 bg-green-50 border-b py-1.5 pr-2"
+                   :style="{paddingLeft: ((node.depth+1)*16+10)+'px'}">
+                <span>📁</span>
+                <input ref="nfi" v-model="newFolderName" @keyup.enter="confirmNewFolder" @keyup.esc="cancelNewFolder"
+                       class="border rounded px-2 py-0.5 text-xs flex-1" placeholder="新文件夹名…" />
+                <button @click="confirmNewFolder" class="text-green-600 text-xs px-1 hover:text-green-800">✓</button>
+                <button @click="cancelNewFolder" class="text-gray-400 text-xs px-1">✗</button>
+              </div>
+            </template>
+
+            <!-- File row -->
+            <div v-else
+                 draggable="true"
+                 @dragstart="onDragStart($event, node.path)"
+                 @dragend="dragging=null; dragTarget=null"
+                 :class="['flex items-center gap-2 border-b text-xs py-1.5 pr-2 transition group',
+                          dragging===node.path ? 'opacity-30' : 'hover:bg-gray-50']"
+                 :style="{paddingLeft: (node.depth*16+10)+'px'}">
+              <span class="text-gray-300 cursor-grab group-hover:text-gray-400 w-4 flex-shrink-0">⠿</span>
+              <span class="text-blue-400 flex-shrink-0">📄</span>
+              <span class="flex-1 text-gray-700 truncate">
+                <span v-if="search" v-html="highlight(node.name, search)"></span>
+                <span v-else>{{ node.name }}</span>
+              </span>
+              <span class="text-gray-300 flex-shrink-0">{{ fmtSize(node.size) }}</span>
+              <button @click="del(node.path)"
+                      class="text-red-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition flex-shrink-0">删除</button>
+            </div>
+
+          </template>
         </div>
       </div>
-      <p v-else class="text-gray-400 text-xs">暂无文档，请上传文件</p>
 
-      <button v-if="result.total" @click="startPreprocess"
-              class="mt-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium">
-        开始预处理 →
-      </button>
+      <!-- Footer -->
+      <div class="flex items-center justify-between mt-3">
+        <span class="text-xs text-gray-400">
+          共 {{ totalFiles }} 个文件
+          <span v-if="search" class="text-blue-500">· 搜索 "{{ search }}"</span>
+        </span>
+        <button v-if="totalFiles" @click="startPreprocess"
+                class="px-4 py-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition text-xs font-medium">
+          开始预处理 →
+        </button>
+      </div>
     </div>
   `,
   setup() {
-    const result = reactive({ items: [], total: 0, page: 1, pages: 1 });
-    const uploading = ref(false);
-    const jumpPage = ref(1);
+    const treeData   = ref([]);
+    const totalFiles = ref(0);
+    const loading    = ref(false);
+    const uploading  = ref(false);
+    const uploadHover = ref(false);
+    const search     = ref('');
+    const expanded   = reactive(new Set());   // folder paths currently open
+    const activeFolder = ref('');             // upload target folder
+    const dragging   = ref(null);             // file path being dragged
+    const dragTarget = ref(null);             // folder path being hovered
+    const newFolderVisible = ref(false);
+    const newFolderParent  = ref('');
+    const newFolderName    = ref('');
+    const nfi = ref(null);                    // new-folder input ref
+    let _searchTimer = null;
 
-    async function load(page = 1) {
-      const n = Math.max(1, Math.min(page, result.pages || 1));
-      const r = await fetch('/api/documents/?page=' + n + '&size=50');
-      const d = await r.json();
-      result.items = d.items;
-      result.total = d.total;
-      result.page  = d.page;
-      result.pages = d.pages;
-      jumpPage.value = d.page;
+    // ── Tree helpers ────────────────────────────────────────────────────────
+    function _flatten(nodes, depth, result) {
+      for (const node of nodes) {
+        result.push({ ...node, depth, children: undefined });
+        if (node.type === 'folder' && expanded.has(node.path)) {
+          _flatten(node.children || [], depth + 1, result);
+        }
+      }
     }
 
-    async function upload(list) {
+    const flatNodes = computed(() => {
+      const list = [];
+      _flatten(treeData.value, 0, list);
+      return list;
+    });
+
+    function toggleFolder(path) {
+      if (expanded.has(path)) expanded.delete(path);
+      else expanded.add(path);
+    }
+
+    function setActiveFolder(path) {
+      activeFolder.value = activeFolder.value === path ? '' : path;
+    }
+
+    // ── API calls ───────────────────────────────────────────────────────────
+    async function loadTree() {
+      loading.value = true;
+      const p = new URLSearchParams({ search: search.value });
+      const r = await apiFetch('/api/documents/tree?' + p);
+      const d = await r.json();
+      treeData.value   = d.tree;
+      totalFiles.value = d.total;
+      // Auto-expand folders when searching
+      if (search.value) {
+        function collectFolders(nodes) {
+          for (const n of nodes) {
+            if (n.type === 'folder') { expanded.add(n.path); collectFolders(n.children || []); }
+          }
+        }
+        collectFolders(d.tree);
+      }
+      loading.value = false;
+    }
+
+    function onSearchInput() {
+      clearTimeout(_searchTimer);
+      _searchTimer = setTimeout(loadTree, 300);
+    }
+
+    async function upload(files) {
       uploading.value = true;
-      for (const f of list) {
+      uploadHover.value = false;
+      for (const f of files) {
         const form = new FormData();
         form.append('file', f);
-        await fetch('/api/documents/upload', { method: 'POST', body: form });
+        form.append('folder', activeFolder.value);
+        await apiFetch('/api/documents/upload', { method: 'POST', body: form });
       }
       uploading.value = false;
-      load(1);
+      if (activeFolder.value) expanded.add(activeFolder.value);
+      loadTree();
     }
 
-    function goPage(p) { load(p); }
-    function onDrop(e) { upload(e.dataTransfer.files); }
+    function onFileDrop(e) {
+      // Only handle actual file drops (not tree-drag events)
+      if (e.dataTransfer.files.length) upload(e.dataTransfer.files);
+    }
+
     function onSelect(e) { upload(e.target.files); }
 
     async function del(path) {
-      if (!confirm('确认删除？')) return;
-      await fetch('/api/documents/' + path, { method: 'DELETE' });
-      load(Math.min(result.page, result.pages));
+      if (!confirm('确认删除文件？')) return;
+      await apiFetch('/api/documents/' + path, { method: 'DELETE' });
+      loadTree();
     }
 
-    async function startPreprocess() {
-      await fetch('/api/pipeline/start', {
+    async function delFolder(path) {
+      if (!confirm(\`确认删除文件夹 "\${path}" 及其所有内容？\`)) return;
+      await apiFetch('/api/documents/' + path, { method: 'DELETE' });
+      expanded.delete(path);
+      if (activeFolder.value === path) activeFolder.value = '';
+      loadTree();
+    }
+
+    // ── Drag-and-drop (tree) ─────────────────────────────────────────────────
+    function onDragStart(e, path) {
+      dragging.value = path;
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', path);
+    }
+
+    async function dropOnFolder(folderPath) {
+      dragTarget.value = null;
+      const src = dragging.value;
+      if (!src) return;
+      dragging.value = null;
+      const srcFolder = src.includes('/') ? src.substring(0, src.lastIndexOf('/')) : '';
+      if (srcFolder === folderPath) return;           // no-op: same folder
+      try {
+        const r = await apiFetch('/api/documents/move', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ src, dest_folder: folderPath }),
+        });
+        const d = await r.json();
+        if (d.moved !== false) {
+          if (folderPath) expanded.add(folderPath);
+          loadTree();
+        }
+      } catch(err) {
+        alert('移动失败: ' + err.message);
+      }
+    }
+
+    // ── New folder ───────────────────────────────────────────────────────────
+    function beginNewFolder(parentPath) {
+      newFolderParent.value  = parentPath;
+      newFolderName.value    = '';
+      newFolderVisible.value = true;
+      if (parentPath) expanded.add(parentPath);
+      nextTick(() => { if (nfi.value) (Array.isArray(nfi.value) ? nfi.value[0] : nfi.value)?.focus(); });
+    }
+
+    async function confirmNewFolder() {
+      const name = newFolderName.value.trim();
+      if (!name) return;
+      const fullPath = newFolderParent.value ? newFolderParent.value + '/' + name : name;
+      await apiFetch('/api/documents/mkdir', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: fullPath }),
+      });
+      expanded.add(fullPath);
+      cancelNewFolder();
+      loadTree();
+    }
+
+    function cancelNewFolder() {
+      newFolderVisible.value = false;
+      newFolderName.value    = '';
+    }
+
+    // ── Misc ─────────────────────────────────────────────────────────────────
+    async function startPreprocess() {
+      await apiFetch('/api/pipeline/start', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ step: 'preprocess' }),
       });
       alert('预处理已启动，请前往「流水线」页面查看进度');
@@ -184,8 +432,24 @@ const PageDocuments = {
       return (b / 1048576).toFixed(1) + ' MB';
     }
 
-    onMounted(() => load(1));
-    return { result, uploading, jumpPage, onDrop, onSelect, del, startPreprocess, fmtSize, load, goPage };
+    function highlight(text, kw) {
+      if (!kw) return text;
+      const esc = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return text.replace(new RegExp('(' + esc + ')', 'gi'),
+        '<mark class="bg-yellow-200 rounded px-0.5">$1</mark>');
+    }
+
+    onMounted(loadTree);
+    return {
+      treeData, flatNodes, totalFiles, loading, uploading, uploadHover,
+      search, expanded, activeFolder, dragging, dragTarget,
+      newFolderVisible, newFolderParent, newFolderName, nfi,
+      loadTree, onSearchInput, toggleFolder, setActiveFolder,
+      onFileDrop, onSelect, del, delFolder,
+      onDragStart, dropOnFolder,
+      beginNewFolder, confirmNewFolder, cancelNewFolder,
+      startPreprocess, fmtSize, highlight,
+    };
   },
 };
 
@@ -267,7 +531,7 @@ const PagePipeline = {
 
     function connect() {
       if (es) es.close();
-      es = new EventSource('/api/pipeline/events');
+      es = new EventSource(apiUrl('/api/pipeline/events'));
       es.onmessage = (e) => {
         const ev = JSON.parse(e.data);
         if (ev.type === 'init') syncStatus(ev.state);
@@ -288,7 +552,7 @@ const PagePipeline = {
 
     async function start(step) {
       logs.value = [];
-      const r = await fetch('/api/pipeline/start', {
+      const r = await apiFetch('/api/pipeline/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ step }),
@@ -316,7 +580,7 @@ const PagePipeline = {
     }
 
     async function stop() {
-      const r = await fetch('/api/pipeline/stop', { method: 'POST' });
+      const r = await apiFetch('/api/pipeline/stop', { method: 'POST' });
       if (!r.ok) {
         const d = await r.json();
         alert(d.detail || '停止失败');
@@ -404,7 +668,7 @@ const PageChunks = {
       const n = Math.max(1, Math.min(page, result.pages || 1));
       loading.value = true; expanded.value = null;
       const p = new URLSearchParams({ page: n, size: 20, doc_type: f.doc_type, insurance_type: f.insurance_type, search: search.value });
-      const r = await fetch('/api/data/chunks?' + p);
+      const r = await apiFetch('/api/data/chunks?' + p);
       Object.assign(result, await r.json());
       jumpPage.value = result.page;
       if (!opts.doc_types.length && result.items.length) {
@@ -547,7 +811,7 @@ const PageQA = {
     const result     = reactive({ items: [], total: 0, page: 1, size: 20, pages: 1 });
 
     async function loadFilterOpts() {
-      const r = await fetch('/api/data/qa/filters');
+      const r = await apiFetch('/api/data/qa/filters');
       const d = await r.json();
       filterOpts.value = {
         insurance_type:    d.insurance_types,
@@ -568,7 +832,7 @@ const PageQA = {
         generation_method: filters.generation_method,
         search:            searchText.value,
       });
-      const r = await fetch('/api/data/qa?' + p);
+      const r = await apiFetch('/api/data/qa?' + p);
       Object.assign(result, await r.json());
       jumpTo.value  = result.page;
       loading.value = false;
@@ -666,7 +930,7 @@ const PageReports = {
     function n(v) { return (v || 0).toLocaleString(); }
 
     async function load() {
-      const r = await fetch('/api/data/reports/overview');
+      const r = await apiFetch('/api/data/reports/overview');
       ov.value = await r.json();
 
       const reasons = ov.value.qc?.rejection_reasons || {};
@@ -721,7 +985,7 @@ const PageGuide = {
   template: `
   <div class="max-w-4xl">
     <h2 class="text-base font-semibold mb-1">系统流程介绍</h2>
-    <p class="text-gray-500 text-xs mb-6">本系统将原始保险文档转化为大规模高质量问答对，供 RAG / Fine-tuning 使用。</p>
+    <p class="text-gray-500 text-xs mb-6">本系统将原始保险文档转化为大规模高质量问答对，供 RAG / Fine-tuning 使用。支持知识型、工具路由型、误区纠正、产品对比、澄清拒答五类问答。P2 质量增强已升级为按来源文档类型分池执行：产品类文档走完整深度质检，法律法规 / 监管文件 / 行业标准走规范性文档专用校验。</p>
 
     <!-- 总览流程图 -->
     <div class="flex items-center gap-1 mb-8 overflow-x-auto pb-2">
@@ -789,7 +1053,7 @@ const PageGuide = {
             <div class="flex gap-3">
               <span class="w-5 h-5 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center font-bold flex-shrink-0 mt-0.5">3</span>
               <div class="flex-1">
-                <div class="font-medium text-gray-800 mb-1">文档类型 &amp; 险种分类（LLM 主分类，正则兜底）</div>
+                <div class="font-medium text-gray-800 mb-1">文档类型 &amp; 险种 &amp; 产品名分类（LLM 主分类，正则兜底）</div>
                 <div class="grid grid-cols-2 gap-2">
                   <div>
                     <div class="text-gray-500 mb-1">文档类型（8类）— LLM 读文件名 + 内容前 1500 字</div>
@@ -808,10 +1072,20 @@ const PageGuide = {
                     <div class="text-gray-500 mt-1.5 text-xs">prompt 中注入完整枚举约束；LLM 返回非法值时回退正则；兜底值"其他保险"</div>
                   </div>
                 </div>
+                <!-- product_name 说明 -->
+                <div class="mt-2 bg-blue-50 border border-blue-200 rounded-lg px-3 py-2">
+                  <span class="font-medium text-blue-800">产品名提取（product_name）：</span>
+                  <span class="text-blue-700 text-xs">LLM 同时抽取具体产品全称（如"中意真爱久久养老年金保险"），并用锚验证（名称须出现在正文前 500 字）。验证失败时自动置空，避免产品名张冠李戴。product_name 随 chunk 传播至种子与扩展条目。</span>
+                </div>
+                <!-- 监管类文档处理 -->
+                <div class="mt-2 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                  <span class="font-medium text-amber-800">监管类文档特殊处理：</span>
+                  <span class="text-amber-700 text-xs">文档类型为"法律法规 / 监管文件 / 行业标准"时，即使 LLM 抽取到产品名也会被强制清空（法规文档不属于任何具体产品），避免监管类 chunk 携带错误的 product_name 污染下游种子和 P2 分池。</span>
+                </div>
                 <!-- 提示词全文 -->
                 <div class="mt-3">
                   <div class="font-medium text-gray-700 mb-1.5">提示词（classify_document.txt）</div>
-                  <pre class="bg-gray-900 text-green-300 rounded-lg p-3 overflow-x-auto leading-5 whitespace-pre-wrap text-xs">你是保险文档分类专家。请根据文件名和内容预览，从给定选项中选择最合适的文档类型和险种。
+                  <pre class="bg-gray-900 text-green-300 rounded-lg p-3 overflow-x-auto leading-5 whitespace-pre-wrap text-xs">你是保险文档分类专家。请根据文件名和内容预览，从给定选项中选择最合适的文档类型和险种，并提取产品名称。
 
 文件名：{file_name}
 
@@ -824,13 +1098,16 @@ const PageGuide = {
 【险种】必须从以下选项中精确选择一个：
 {insurance_types}
 
+【产品名称】若文档是特定保险产品的条款/说明书，提取完整产品全称（如"中意真爱久久养老年金保险"）；无法确定则返回空字符串""
+
 规则：
 - 如果文档涉及多个险种，选最主要的一个
 - 险种无法判断时选"其他保险"
 - 文档类型无法判断时选"未分类"
+- 产品名必须是正式全称，不要缩写或别称
 
 只返回 JSON，不要任何其他说明：
-{"doc_type": "...", "insurance_type": "..."}</pre>
+{"doc_type": "...", "insurance_type": "...", "product_name": "..."}</pre>
                 </div>
               </div>
             </div>
@@ -1076,7 +1353,44 @@ const PageGuide = {
           <span class="ml-auto text-xs text-yellow-600 bg-yellow-100 px-2 py-0.5 rounded-full">expander.py</span>
         </div>
         <div class="px-4 py-4 text-xs space-y-5">
-          <p class="text-gray-600">将种子 Q&A 通过三种方式扩展到 10 万+，增加问法多样性和覆盖深度。每种扩展方式独立并发，均有断点续传。</p>
+          <p class="text-gray-600">将种子 Q&A 通过多种方式扩展到 10 万+，增加问法多样性和覆盖深度。LLM 扩展按种子质量分级，零 LLM 路径并行运行。</p>
+
+          <!-- 种子质量评分 -->
+          <div class="bg-amber-50 border border-amber-200 rounded-xl p-3 space-y-2">
+            <div class="font-semibold text-amber-800">种子质量评分驱动分级扩展（score_seed）</div>
+            <div class="text-gray-600">对每条种子计算 0.0–1.0 质量分，决定扩展倍率，避免低质量种子浪费 LLM 调用：</div>
+            <div class="grid grid-cols-4 gap-2 text-xs">
+              <div class="bg-white border rounded-lg p-2">
+                <div class="font-medium text-gray-700 mb-1">评分维度</div>
+                <ul class="space-y-0.5 text-gray-600">
+                  <li>• 答案长度（&gt;150字 +0.1）</li>
+                  <li>• 含数字/金额/期限 +0.15</li>
+                  <li>• 含法条引用（第XX条）+0.1</li>
+                  <li class="text-indigo-600">• 产品名出现在问题中 +0.1<br/><span class="text-gray-400 text-xs">（仅产品类有效；监管类通过法条引用维度补偿）</span></li>
+                  <li>• 专业难度 +0.1</li>
+                  <li class="text-red-500">• 答案&lt;50字 −0.2</li>
+                </ul>
+              </div>
+              <div class="bg-green-50 border border-green-200 rounded-lg p-2">
+                <div class="font-semibold text-green-700">高质量 ≥ 0.8</div>
+                <div class="text-gray-600 mt-1">改述 ×5 + 追问 ×4</div>
+                <div class="text-green-600 text-xs mt-1">最大化复用</div>
+              </div>
+              <div class="bg-blue-50 border border-blue-200 rounded-lg p-2">
+                <div class="font-semibold text-blue-700">中等 0.5–0.8</div>
+                <div class="text-gray-600 mt-1">改述 ×3 + 追问 ×2</div>
+                <div class="text-blue-600 text-xs mt-1">适度扩展</div>
+              </div>
+              <div class="bg-red-50 border border-red-200 rounded-lg p-2">
+                <div class="font-semibold text-red-700">低质量 &lt; 0.5</div>
+                <div class="text-gray-600 mt-1">跳过 LLM 扩展</div>
+                <div class="text-red-600 text-xs mt-1">直接进质检</div>
+              </div>
+            </div>
+            <div class="text-xs text-amber-700 bg-white border border-amber-100 rounded px-2 py-1">
+              监管类种子没有 product_name，不得"产品名"加分，但含 <code>第XX条</code> 法条引用的答案仍可通过"法条引用 +0.1"和"含数字/期限 +0.15"拿到中高分，正常进入改述/追问扩展。
+            </div>
+          </div>
 
           <!-- 流程示意 -->
           <div class="flex items-start gap-2 overflow-x-auto pb-1">
@@ -1084,20 +1398,24 @@ const PageGuide = {
               <div class="font-semibold text-purple-700">种子 Q&A</div>
               <div class="text-purple-500">~5 万条</div>
             </div>
-            <div class="flex-shrink-0 flex flex-col gap-1.5 pt-1">
+            <div class="flex-shrink-0 flex flex-col gap-1 pt-1">
+              <div class="text-gray-400">→</div><div class="text-gray-400">→</div><div class="text-gray-400">→</div>
               <div class="text-gray-400">→</div><div class="text-gray-400">→</div><div class="text-gray-400">→</div>
             </div>
-            <div class="flex-shrink-0 flex flex-col gap-1.5">
-              <div class="bg-orange-50 border border-orange-200 rounded px-2.5 py-1.5">① 改述变体 × 5 → <strong>25万条</strong></div>
-              <div class="bg-blue-50 border border-blue-200 rounded px-2.5 py-1.5">② 追问链 × 4轮 → <strong>20万条</strong></div>
-              <div class="bg-teal-50 border border-teal-200 rounded px-2.5 py-1.5">③ 模板驱动（文档参数化） → <strong>数千条</strong></div>
+            <div class="flex-shrink-0 flex flex-col gap-1">
+              <div class="bg-orange-50 border border-orange-200 rounded px-2.5 py-1.5">① 改述变体（按质量分级×3–5）→ <strong>~25万条</strong></div>
+              <div class="bg-blue-50 border border-blue-200 rounded px-2.5 py-1.5">② 追问链（按质量分级×2–4轮）→ <strong>~20万条</strong></div>
+              <div class="bg-teal-50 border border-teal-200 rounded px-2.5 py-1.5">③ 模板驱动（文档参数化）→ <strong>数千条</strong></div>
+              <div class="bg-red-50 border border-red-200 rounded px-2.5 py-1.5">④ 工具路由（零LLM模板）→ <strong>~1511条</strong></div>
+              <div class="bg-pink-50 border border-pink-200 rounded px-2.5 py-1.5">⑤ 产品对比（结构化流水线）→ <strong>数百条</strong></div>
+              <div class="bg-gray-50 border border-gray-200 rounded px-2.5 py-1.5">⑥ 误区纠正 + 澄清拒答（零/少LLM）→ <strong>数百条</strong></div>
             </div>
-            <div class="flex-shrink-0 flex flex-col gap-1.5 pt-1">
-              <div class="text-gray-400">↘</div><div class="text-gray-400">→</div><div class="text-gray-400">↗</div>
+            <div class="flex-shrink-0 flex flex-col gap-1 pt-1 self-center">
+              <div class="text-gray-400 text-lg">→</div>
             </div>
             <div class="flex-shrink-0 bg-green-50 border border-green-200 rounded-lg px-3 py-2 text-center self-center">
               <div class="font-semibold text-green-700">扩展 Q&A 汇总</div>
-              <div class="text-green-500">~45万条 → 质检</div>
+              <div class="text-green-500">→ 质检</div>
             </div>
           </div>
 
@@ -1112,34 +1430,28 @@ const PageGuide = {
                 <span class="font-medium">核心逻辑：</span>对同一知识点生成多种不同问法，答案核心不变但表述微调。
                 强制要求覆盖至少 3 种维度：<span class="text-orange-700 font-medium">直接提问 / 场景嵌入 / 反问确认 / 对比切入 / 口语化</span>。
               </div>
+              <!-- 提示词分类说明 -->
+              <div class="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-xs text-amber-800">
+                <span class="font-medium">按文档类型自动选择提示词：</span>扩展器通过种子的 <code class="bg-white px-1 rounded">doc_type</code> 字段（或 source_doc 文件名推断）判断来源类型。产品类文档使用 <code class="bg-white px-1 rounded">expand_rephrase.txt</code>（要求保留条款版本注释、覆盖产品场景）；监管类文档使用 <code class="bg-white px-1 rounded">expand_rephrase_regulatory.txt</code>（引用法条编号、禁止产品赔付结论、覆盖权利义务角度）。
+              </div>
               <div>
-                <div class="font-medium text-gray-700 mb-1">提示词（expand_rephrase.txt）</div>
-                <pre class="bg-gray-900 text-green-300 rounded-lg p-3 overflow-x-auto leading-5 whitespace-pre-wrap text-xs">你是保险知识问答改写专家。请将以下保险问答对扩展为 {num_variants} 个改述变体。
-
-## 原始问答
-- 问题：{original_question}
-- 答案：{original_answer}
-- 险种：{insurance_type}
-- 难度：{difficulty}
-
-## 改述要求
-1. 每个变体的提问方式必须明显不同，覆盖以下至少 3 种维度：
-   - 直接提问："XX 是什么？"
-   - 场景嵌入："我遇到了 XX 情况，想问问……"
-   - 反问确认："XX 是不是意味着……？"
-   - 对比切入："XX 和 YY 是一回事吗？"
-   - 口语化："那个啥，就是说……能赔不？"
-2. 答案根据问法微调表述，核心信息不变
-3. 避免仅替换个别词语的"伪变体"
-4. 原始答案中的条款版本注释和末尾免责提示必须完整保留
-
-输出 JSON 数组：
-[{ "question", "answer", "difficulty", "question_type",
-   "insurance_type", "rephrasing_type", "parent_id" }]</pre>
+                <div class="font-medium text-gray-700 mb-1">提示词 A — 产品类（expand_rephrase.txt）</div>
+                <pre class="bg-gray-900 text-green-300 rounded-lg p-3 overflow-x-auto leading-5 whitespace-pre-wrap text-xs">维度：直接提问 / 场景嵌入 / 反问确认 / 对比切入 / 口语化
+要求：保留条款版本注释和末尾免责提示；答案核心信息不变
+输出：[{ "question", "answer", "difficulty", "question_type",
+         "insurance_type", "rephrasing_type", "parent_id" }]</pre>
+              </div>
+              <div>
+                <div class="font-medium text-gray-700 mb-1">提示词 B — 监管类（expand_rephrase_regulatory.txt）</div>
+                <pre class="bg-gray-900 text-purple-300 rounded-lg p-3 overflow-x-auto leading-5 whitespace-pre-wrap text-xs">维度：直接提问 / 场景嵌入 / 反问确认 / 对比切入 / 权利义务角度
+要求：引用法条编号须准确；不得声称具体产品赔付金额或承保条件
+      末尾保留监管变动免责提示
+输出：[{ "question", "answer", "difficulty", "question_type",
+         "insurance_type", "rephrasing_type", "parent_id" }]</pre>
               </div>
               <div class="grid grid-cols-3 gap-2 text-gray-600">
-                <div class="bg-gray-50 rounded p-2"><span class="font-medium">输入字段：</span><br/>original_question<br/>original_answer<br/>insurance_type / difficulty</div>
-                <div class="bg-gray-50 rounded p-2"><span class="font-medium">输出新增字段：</span><br/>rephrasing_type（改述类型）<br/>parent_id（溯源至种子）</div>
+                <div class="bg-gray-50 rounded p-2"><span class="font-medium">输入字段：</span><br/>original_question<br/>original_answer<br/>insurance_type / difficulty<br/><span class="text-amber-600">doc_type（决定选哪套提示词）</span></div>
+                <div class="bg-gray-50 rounded p-2"><span class="font-medium">输出新增字段：</span><br/>rephrasing_type（改述类型）<br/>parent_id（溯源至种子）<br/><span class="text-amber-600">doc_type / source_chunk_id / source_doc（从种子传播）</span></div>
                 <div class="bg-orange-50 rounded p-2"><span class="font-medium">断点续传：</span><br/>rephrase_checkpoint.json<br/>按 parent_id 记录<br/>重启自动跳过</div>
               </div>
             </div>
@@ -1153,34 +1465,29 @@ const PageGuide = {
             </div>
             <div class="p-3 space-y-2">
               <div class="text-gray-600">
-                <span class="font-medium">核心逻辑：</span>模拟真实用户与客服的多轮对话。每轮追问是对上一轮答案的自然延伸，
-                覆盖方向：<span class="text-blue-700 font-medium">深入细节 / 边界探索 / 实操追问 / 费用时间 / 补救方案</span>。
+                <span class="font-medium">核心逻辑：</span>模拟真实用户与客服的多轮对话。每轮追问是对上一轮答案的自然延伸，同样按来源文档类型选择不同提示词。
+              </div>
+              <!-- 提示词分类说明 -->
+              <div class="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-xs text-amber-800">
+                <span class="font-medium">按文档类型自动选择提示词：</span>产品类使用 <code class="bg-white px-1 rounded">expand_followup.txt</code>（追问方向：<span class="font-medium">深入细节 / 边界探索 / 实操追问 / 费用时间 / 补救方案</span>）；监管类使用 <code class="bg-white px-1 rounded">expand_followup_regulatory.txt</code>（追问方向：<span class="font-medium">法条深挖 / 适用范围边界 / 执行层面操作 / 与其他法规关联 / 违规后果</span>）。
               </div>
               <div>
-                <div class="font-medium text-gray-700 mb-1">提示词（expand_followup.txt）</div>
-                <pre class="bg-gray-900 text-green-300 rounded-lg p-3 overflow-x-auto leading-5 whitespace-pre-wrap text-xs">你是保险客服对话模拟器。请基于以下问答，生成一条自然的 {chain_length} 轮追问链。
-
-## 初始问答
-- 问题：{original_question}
-- 答案：{original_answer}
-- 险种：{insurance_type}
-
-## 要求
-1. 每轮追问是看完上一轮答案后的自然延伸，不能跳跃
-2. 追问方向至少覆盖 3 种：
-   深入细节 / 边界探索 / 实操追问 / 费用时间 / 补救方案
-3. 模拟真实对话节奏：越往后越具体
-4. 问题要有情绪和细节（具体数字、时间线）
-5. 每轮答案引用条款时须注明文件版本；
-   末尾保留免责提示
-
-输出 JSON 数组（每轮为独立问答对）：
-[{ "question", "answer", "difficulty", "question_type",
-   "insurance_type", "follow_up_type", "turn", "parent_id" }]</pre>
+                <div class="font-medium text-gray-700 mb-1">提示词 A — 产品类（expand_followup.txt）</div>
+                <pre class="bg-gray-900 text-green-300 rounded-lg p-3 overflow-x-auto leading-5 whitespace-pre-wrap text-xs">追问方向：深入细节 / 边界探索 / 实操追问 / 费用时间 / 补救方案
+要求：越往后越具体；条款引用须注明文件版本；末尾保留免责提示
+输出：[{ "question", "answer", "difficulty", "question_type",
+         "insurance_type", "follow_up_type", "turn", "parent_id" }]</pre>
+              </div>
+              <div>
+                <div class="font-medium text-gray-700 mb-1">提示词 B — 监管类（expand_followup_regulatory.txt）</div>
+                <pre class="bg-gray-900 text-purple-300 rounded-lg p-3 overflow-x-auto leading-5 whitespace-pre-wrap text-xs">追问方向：法条深挖 / 适用范围边界 / 执行层面操作 / 与其他法规关联 / 违规后果
+要求：条文编号须准确；不得给出产品承保结论；末尾保留监管变动免责提示
+输出：[{ "question", "answer", "difficulty", "question_type",
+         "insurance_type", "follow_up_type", "turn", "parent_id" }]</pre>
               </div>
               <div class="grid grid-cols-3 gap-2 text-gray-600">
-                <div class="bg-gray-50 rounded p-2"><span class="font-medium">输入字段：</span><br/>original_question<br/>original_answer<br/>insurance_type</div>
-                <div class="bg-gray-50 rounded p-2"><span class="font-medium">输出新增字段：</span><br/>follow_up_type（追问类型）<br/>turn（第几轮，1–4）<br/>parent_id（溯源至种子）</div>
+                <div class="bg-gray-50 rounded p-2"><span class="font-medium">输入字段：</span><br/>original_question<br/>original_answer<br/>insurance_type<br/><span class="text-amber-600">doc_type（决定选哪套提示词）</span></div>
+                <div class="bg-gray-50 rounded p-2"><span class="font-medium">输出新增字段：</span><br/>follow_up_type（追问类型）<br/>turn（第几轮，1–4）<br/>parent_id（溯源至种子）<br/><span class="text-amber-600">doc_type / source_chunk_id / source_doc（从种子传播）</span></div>
                 <div class="bg-blue-50 rounded p-2"><span class="font-medium">断点续传：</span><br/>followup_checkpoint.json<br/>按 parent_id 记录<br/>重启自动跳过</div>
               </div>
             </div>
@@ -1227,6 +1534,122 @@ const PageGuide = {
             </div>
           </div>
 
+          <!-- 方式四 -->
+          <div class="border border-red-200 rounded-xl overflow-hidden">
+            <div class="bg-red-50 px-3 py-2 flex items-center gap-2">
+              <span class="font-semibold text-red-800">④ 工具路由（Tool Routing）</span>
+              <span class="ml-auto text-red-500">零 LLM · 纯模板 · ~1511 条</span>
+              <span class="bg-red-700 text-white text-xs px-2 py-0.5 rounded-full">无 API 成本</span>
+            </div>
+            <div class="p-3 space-y-2 text-xs">
+              <div class="text-gray-600">
+                <span class="font-medium">核心逻辑：</span>对涉及<strong>核保判断、保费查询、现金价值、理赔结论、账户余额</strong>等敏感维度的问题，LLM 不直接给出结论，而是返回工具路由指令（调用对应系统工具获取实时数据）。这类问题完全由模板生成，无需 LLM 调用。
+              </div>
+              <div class="grid grid-cols-2 gap-3">
+                <div>
+                  <div class="font-medium text-gray-700 mb-1">核保（underwriting_check）</div>
+                  <div class="text-gray-500 mb-1">30 种疾病 × 6 大险种 × 8 种问法 = 1440 条</div>
+                  <div class="text-gray-500">疾病：乙肝/高血压/糖尿病/心脏病/癌症 等</div>
+                  <div class="text-gray-500">险种：重疾险/医疗险/寿险/意外险/年金/护理险</div>
+                </div>
+                <div>
+                  <div class="font-medium text-gray-700 mb-1">其他路由场景（~71 条）</div>
+                  <ul class="space-y-0.5 text-gray-500">
+                    <li>• <code class="bg-gray-100 px-1 rounded">premium_calculator</code>：保费估算 × 产品类型</li>
+                    <li>• <code class="bg-gray-100 px-1 rounded">cash_value_table</code>：现金价值 × 保单年期</li>
+                    <li>• <code class="bg-gray-100 px-1 rounded">claim_status_api</code>：理赔进度/结论查询</li>
+                    <li>• <code class="bg-gray-100 px-1 rounded">account_api</code>：账户余额/账单查询</li>
+                  </ul>
+                </div>
+              </div>
+              <div class="bg-red-50 rounded p-2 text-gray-600">
+                <span class="font-medium">安全校验：</span>所有工具路由 Q&A 经 <code class="bg-white px-1 rounded">validate_tool_routing_safety</code> 检测——若答案包含如"可以投保""一定能赔"等 10 类确定性结论，则标记为高风险并拒绝入库（敏感问题不允许 LLM 直接下结论）。
+              </div>
+            </div>
+          </div>
+
+          <!-- 方式五 -->
+          <div class="border border-pink-200 rounded-xl overflow-hidden">
+            <div class="bg-pink-50 px-3 py-2 flex items-center gap-2">
+              <span class="font-semibold text-pink-800">⑤ 产品对比（Product Comparison）</span>
+              <span class="ml-auto text-pink-500">3 阶段流水线 · 8 组白名单对比</span>
+            </div>
+            <div class="p-3 space-y-2 text-xs">
+              <div class="text-gray-600">
+                <span class="font-medium">核心逻辑：</span>直接让 LLM 对比两款产品风险极高（可能编造数据）。本系统采用<strong>中间结构化</strong>方案：先抽取各产品档案 → 结构化对比 → 自然语言渲染，每步独立可验证。
+              </div>
+              <div class="flex items-center gap-2 overflow-x-auto">
+                <div class="flex-shrink-0 bg-gray-50 border rounded-lg px-3 py-2 text-center">
+                  <div class="font-medium text-gray-700">各产品 chunks</div>
+                </div>
+                <div class="text-gray-400">→</div>
+                <div class="flex-shrink-0 bg-blue-50 border border-blue-200 rounded-lg px-3 py-2">
+                  <div class="font-semibold text-blue-700">① 档案提取</div>
+                  <div class="text-gray-500">extract_comparison_profile</div>
+                  <div class="text-gray-500">→ doc_comparison_profiles.jsonl</div>
+                </div>
+                <div class="text-gray-400">→</div>
+                <div class="flex-shrink-0 bg-purple-50 border border-purple-200 rounded-lg px-3 py-2">
+                  <div class="font-semibold text-purple-700">② 结构化对比</div>
+                  <div class="text-gray-500">generate_product_comparison</div>
+                  <div class="text-gray-500">9 个固定维度（含"有据"/"无据"标注）</div>
+                </div>
+                <div class="text-gray-400">→</div>
+                <div class="flex-shrink-0 bg-green-50 border border-green-200 rounded-lg px-3 py-2">
+                  <div class="font-semibold text-green-700">③ NL 渲染</div>
+                  <div class="text-gray-500">render_product_comparison_answer</div>
+                  <div class="text-gray-500">→ 自然语言 Q&A</div>
+                </div>
+              </div>
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <div class="font-medium text-gray-700 mb-1">8 组白名单对比对</div>
+                  <div class="space-y-0.5 text-gray-500">
+                    <div>重疾险 vs 百万医疗险 / 重疾险 vs 防癌险</div>
+                    <div>百万医疗险 vs 惠民保 / 定期寿险 vs 终身寿险</div>
+                    <div>终身寿险 vs 增额终身寿 / 交强险 vs 第三者责任险</div>
+                    <div>车损险 vs 第三者责任险 / 雇主责任险 vs 公众责任险</div>
+                  </div>
+                </div>
+                <div>
+                  <div class="font-medium text-gray-700 mb-1">敏感维度路由</div>
+                  <div class="space-y-0.5 text-gray-500">
+                    <div>保费对比 → <code class="bg-gray-100 px-1 rounded">premium_calculator</code></div>
+                    <div>赔付金额 → <code class="bg-gray-100 px-1 rounded">claim_calculator</code></div>
+                    <div>投保资格 → <code class="bg-gray-100 px-1 rounded">underwriting_check</code></div>
+                  </div>
+                  <div class="text-gray-500 mt-1">敏感维度生成 <code class="bg-gray-100 px-1 rounded">tool_routed_comparison</code> 类型，不直接给结论</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 方式六 -->
+          <div class="border border-gray-200 rounded-xl overflow-hidden">
+            <div class="bg-gray-50 px-3 py-2 flex items-center gap-2">
+              <span class="font-semibold text-gray-700">⑥ 误区纠正 + 澄清拒答</span>
+              <span class="ml-auto text-gray-500">少量 LLM / 零 LLM · 数百条</span>
+            </div>
+            <div class="p-3 grid grid-cols-2 gap-3 text-xs">
+              <div>
+                <div class="font-medium text-gray-700 mb-1">误区纠正（misconception_correction）</div>
+                <div class="text-gray-500 mb-1">12 条预设常见误区，LLM 基于误区描述生成"问题+纠正答案"，qa_category = misconception_correction</div>
+                <div class="space-y-0.5 text-gray-500">
+                  <div>示例：重疾险出院就能赔 / 社保能报销所有费用</div>
+                  <div>示例：寿险出院就能赔 / 车险不出险保费会退</div>
+                </div>
+              </div>
+              <div>
+                <div class="font-medium text-gray-700 mb-1">澄清引导 + 拒答（零 LLM）</div>
+                <div class="text-gray-500 mb-1">4 类澄清模板 + 4 类拒答模板，完全模板生成，qa_category = refusal_or_clarification</div>
+                <div class="space-y-0.5 text-gray-500">
+                  <div>澄清：不完整信息 / 模糊险种 / 理赔结果询问</div>
+                  <div>拒答：违规要求 / 超出范围 / 敏感咨询引导</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
           <!-- 并发 & 调度 -->
           <div class="bg-gray-50 border rounded-xl p-3 space-y-1.5 text-gray-600">
             <div class="font-medium text-gray-700">调度 & 容错机制</div>
@@ -1250,26 +1673,39 @@ const PageGuide = {
           <span class="font-semibold text-green-800">Step 4 · 质量检查</span>
           <span class="ml-auto text-xs text-green-600 bg-green-100 px-2 py-0.5 rounded-full">quality_checker.py</span>
         </div>
-        <div class="px-4 py-3 grid grid-cols-2 gap-4 text-xs">
+        <div class="px-4 py-4 text-xs space-y-4">
+          <!-- 基础三道过滤 -->
+          <div class="grid grid-cols-2 gap-4">
           <div>
-            <div class="font-medium text-gray-700 mb-1.5">三道过滤</div>
+            <div class="font-medium text-gray-700 mb-1.5">基础过滤（每条必过）</div>
             <div class="text-gray-500 mb-2">语义去重已前置到 Step 2b，质检阶段不再重复计算，速度更快。</div>
             <div class="space-y-2">
               <div class="flex gap-2">
                 <span class="w-5 h-5 rounded-full bg-green-100 text-green-700 flex items-center justify-center font-bold flex-shrink-0">1</span>
+                <div>
+                  <span class="font-medium">元数据规范化（normalize_metadata）</span>：自动推断并修正
+                  <code class="bg-gray-100 px-1 rounded">business_stage</code>（12 阶段归一化映射）、
+                  <code class="bg-gray-100 px-1 rounded">difficulty</code>、
+                  <code class="bg-gray-100 px-1 rounded">question_type</code>（15 种），
+                  并按答案内容推断
+                  <code class="bg-gray-100 px-1 rounded">qa_category</code>（5类）；填充缺省值
+                </div>
+              </div>
+              <div class="flex gap-2">
+                <span class="w-5 h-5 rounded-full bg-red-100 text-red-700 flex items-center justify-center font-bold flex-shrink-0">2</span>
+                <div><span class="font-medium">工具路由安全校验（validate_tool_routing_safety）</span>：检测 10 类高风险短语（如"可以投保""一定能赔""保费为\d+元"），命中则拒绝入库——敏感问题严禁 LLM 直接下结论</div>
+              </div>
+              <div class="flex gap-2">
+                <span class="w-5 h-5 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center font-bold flex-shrink-0">3</span>
                 <div><span class="font-medium">格式校验</span>：必填字段、长度范围（问题 8–500字，答案 20–2000字）、拒答检测</div>
               </div>
               <div class="flex gap-2">
-                <span class="w-5 h-5 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center font-bold flex-shrink-0">2</span>
-                <div><span class="font-medium">兜底去重（增量）</span>：以历史已通过数据为基准，新条目只与基准 + 本批内部比对（embedding 或 n-gram），捕获扩展阶段引入的新重复，不对历史数据重跑</div>
+                <span class="w-5 h-5 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center font-bold flex-shrink-0">4</span>
+                <div><span class="font-medium">兜底去重（增量）</span>：预分配 numpy 矩阵做 O(N×K) 余弦相似度，新条目只与历史已通过 + 本批已通过比对，不对全量重跑</div>
               </div>
               <div class="flex gap-2">
-                <span class="w-5 h-5 rounded-full bg-yellow-100 text-yellow-700 flex items-center justify-center font-bold flex-shrink-0">3</span>
-                <div><span class="font-medium">事实校验</span>：规则引擎核查交强险限额、等待期天数、犹豫期等已知事实</div>
-              </div>
-              <div class="flex gap-2">
-                <span class="w-5 h-5 rounded-full bg-purple-100 text-purple-700 flex items-center justify-center font-bold flex-shrink-0">4</span>
-                <div><span class="font-medium">覆盖率分析</span>：统计险种 × 问题类型的覆盖矩阵，识别空白和薄弱区域</div>
+                <span class="w-5 h-5 rounded-full bg-yellow-100 text-yellow-700 flex items-center justify-center font-bold flex-shrink-0">5</span>
+                <div><span class="font-medium">事实校验</span>：规则引擎核查交强险限额、等待期（90天）、犹豫期（15天）、宽限期（60天）、复效期（2年）、不可抗辩期（2年）、理赔核定时限（30+10天）</div>
               </div>
             </div>
           </div>
@@ -1279,7 +1715,7 @@ const PageGuide = {
               <li>• <code class="bg-gray-100 px-1 rounded">qa_passed.jsonl</code> — 历次通过质检的 Q&A（追加写入）</li>
               <li>• <code class="bg-gray-100 px-1 rounded">qa_rejected.jsonl</code> — 被拒绝的（含原因，追加写入）</li>
               <li>• <code class="bg-gray-100 px-1 rounded">qc_manifest.json</code> — 已质检文件清单（filepath → mtime）</li>
-              <li>• <code class="bg-gray-100 px-1 rounded">qc_report.json</code> — 各阶段统计报告</li>
+              <li>• <code class="bg-gray-100 px-1 rounded">qc_report.json</code> — 各阶段统计 + 3D 覆盖矩阵 + qa_category 分布</li>
             </ul>
             <div class="font-medium text-gray-700 mt-3 mb-1.5">断点续传（真增量）</div>
             <ul class="space-y-1 text-gray-600">
@@ -1299,6 +1735,81 @@ const PageGuide = {
               <span v-else class="text-gray-400">加载中…</span>
             </div>
           </div>
+          </div><!-- end grid -->
+
+          <!-- P2 深度质量 -->
+          <div class="border border-indigo-200 rounded-xl overflow-hidden">
+            <div class="bg-indigo-50 border-b px-4 py-2.5 flex items-center gap-2">
+              <span class="text-lg">🔬</span>
+              <span class="font-semibold text-indigo-800">P2 深度质量增强</span>
+              <span class="ml-auto text-xs text-indigo-600 bg-indigo-100 px-2 py-0.5 rounded-full">cmd_p2_quality</span>
+            </div>
+            <div class="px-4 py-3 grid grid-cols-3 gap-4">
+
+              <div>
+                <div class="font-medium text-gray-700 mb-1.5">分池执行</div>
+                <p class="text-gray-500 mb-2">P2 不再直接对 <code class="bg-gray-100 px-1 rounded">qa_passed.jsonl</code> 全量混跑，而是先基于 <code class="bg-gray-100 px-1 rounded">source_chunk_id / source_doc</code> 回查来源文档类型。</p>
+                <div class="space-y-1.5">
+                  <div class="bg-indigo-50 border border-indigo-200 rounded p-2 text-gray-600">
+                    <div class="font-medium text-indigo-700">product_docs</div>
+                    <div class="mt-0.5">保险条款 / 理赔指南 / 核保手册 / 产品说明书</div>
+                  </div>
+                  <div class="bg-purple-50 border border-purple-200 rounded p-2 text-gray-600">
+                    <div class="font-medium text-purple-700">regulatory_docs</div>
+                    <div class="mt-0.5">法律法规 / 监管文件 / 行业标准</div>
+                  </div>
+                  <div class="bg-gray-50 border rounded p-2 text-gray-600">
+                    <div class="font-medium text-gray-700">unknown_docs</div>
+                    <div class="mt-0.5">无法判定来源时默认按规范类策略兜底</div>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <div class="font-medium text-gray-700 mb-1.5">回溯与评分</div>
+                <p class="text-gray-500 mb-2">产品类与规范类使用不同的回溯和评分标准，避免法规类问答误用产品型数字锚点校验。</p>
+                <div class="space-y-1.5">
+                  <div class="bg-blue-50 border border-blue-200 rounded p-2 text-gray-600">
+                    <div class="font-medium text-blue-700">产品类</div>
+                    <div class="mt-0.5">锚点校验金额/期限等硬事实；LLM 二级校验使用 <code class="bg-white px-0.5 rounded">verify_answer.txt</code>；评分使用 <code class="bg-white px-0.5 rounded">score_product_qa.txt</code>（准确性/完整性/实用性/专业性/清晰度）。</div>
+                  </div>
+                  <div class="bg-purple-50 border border-purple-200 rounded p-2 text-gray-600">
+                    <div class="font-medium text-purple-700">规范类</div>
+                    <div class="mt-0.5">锚点只校验法条编号与明确期限/金额；LLM 二级校验使用 <code class="bg-white px-0.5 rounded">verify_answer_regulatory.txt</code>（关注法条准确性与越界推断风险，允许合理归纳）；评分使用 <code class="bg-white px-0.5 rounded">score_regulatory_qa.txt</code>（法规准确性/引用恰当性/越界风险/清晰度/知识库适配度）。</div>
+                  </div>
+                  <div class="bg-amber-50 border border-amber-200 rounded p-2 text-gray-600">
+                    <div class="font-medium text-amber-700">跨池一致性检测</div>
+                    <div class="mt-0.5">评分阶段自动检测：产品池中 product_name 为空的条目 / 规范池中携带 product_name 的条目，输出 WARNING 日志，便于排查分池错误。</div>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <div class="font-medium text-gray-700 mb-1.5">P2 报告</div>
+                <p class="text-gray-500 mb-2">P2 运行后会额外产出分池报告，帮助观察不同文档族的质量情况。</p>
+                <div class="space-y-1.5">
+                  <div class="bg-gray-50 border rounded p-2 text-gray-600">
+                    <span class="font-medium">pool_counts</span>
+                    <div class="text-gray-500 mt-0.5">三池样本量统计</div>
+                  </div>
+                  <div class="bg-gray-50 border rounded p-2 text-gray-600">
+                    <span class="font-medium">verify_flagged_by_pool</span>
+                    <div class="text-gray-500 mt-0.5">各池回溯存疑数</div>
+                  </div>
+                  <div class="bg-gray-50 border rounded p-2 text-gray-600">
+                    <span class="font-medium">avg_scores_by_pool</span>
+                    <div class="text-gray-500 mt-0.5">产品类 / 规范类均分</div>
+                  </div>
+                  <div class="bg-gray-50 border rounded p-2 text-gray-600">
+                    <span class="font-medium">unknown_doc_count</span>
+                    <div class="text-gray-500 mt-0.5">来源不明条目数量，便于后续治理</div>
+                  </div>
+                </div>
+              </div>
+
+            </div>
+          </div>
+
         </div>
       </div>
 
@@ -1336,6 +1847,7 @@ const PageGuide = {
               <li>• SSE 实时推送日志</li>
               <li>• asyncio 并发 LLM 调用</li>
               <li>• 后台线程运行 pipeline</li>
+              <li>• <code class="bg-gray-100 px-1 rounded">GET /api/qa/ask</code> Bigram 相似度检索，返回 top-5 候选 + tool_routing 标识</li>
             </ul>
           </div>
           <div>
@@ -1343,7 +1855,8 @@ const PageGuide = {
             <ul class="space-y-1 text-gray-500">
               <li>• DeepSeek API（OpenAI 兼容）</li>
               <li>• 种子生成：并发 20</li>
-              <li>• 扩展：并发 5</li>
+              <li>• 扩展：按质量分级并发 5</li>
+              <li>• 工具路由 / 澄清拒答：零 LLM</li>
               <li>• 自动重试 + 断点续传</li>
             </ul>
           </div>
@@ -1379,13 +1892,13 @@ const PageGuide = {
       { name: '操作指引', tpl: '办理{险种}的{流程}需要准备什么？' },
       { name: '除外责任', tpl: '{险种}中"{除外}"属于除外责任吗？' },
     ];
-    const crossCount = 19;
+    const crossCount = 8;
     const stats = reactive({ chunks: null, seeds: null, expanded: null, qc: null });
 
     onMounted(async () => {
       // 从 overview 拿种子数、扩展数、质检报告
       try {
-        const r = await fetch('/api/data/reports/overview');
+        const r = await apiFetch('/api/data/reports/overview');
         const d = await r.json();
         stats.seeds    = d.seeds_total    || 0;
         stats.expanded = d.expanded_total || 0;
@@ -1393,7 +1906,7 @@ const PageGuide = {
       } catch {}
       // chunk 统计：直接读 /chunks/stats，包含总数、文档数、分布
       try {
-        const r = await fetch('/api/data/chunks/stats');
+        const r = await apiFetch('/api/data/chunks/stats');
         const d = await r.json();
         stats.chunks = {
           total_chunks: d.total_chunks || 0,
@@ -1405,12 +1918,12 @@ const PageGuide = {
       } catch {}
     });
     const dataFlow = [
-      { count: '~50+',  label: '原始文档',   color: 'text-blue-600',   op: '分块' },
-      { count: '~800',  label: 'Chunks',    color: 'text-blue-500',   op: '×8 LLM' },
-      { count: '~5万',  label: '种子 Q&A',  color: 'text-purple-600', op: '×10 扩展' },
-      { count: '~50万', label: '扩展 Q&A',  color: 'text-yellow-600', op: '质检过滤' },
-      { count: '~15万', label: '通过质检',   color: 'text-green-600',  op: '入库' },
-      { count: '~15万', label: '最终数据集', color: 'text-gray-700',   op: '' },
+      { count: '~50+',  label: '原始文档',        color: 'text-blue-600',   op: '分块+产品名' },
+      { count: '~800',  label: 'Chunks',          color: 'text-blue-500',   op: '×8 LLM' },
+      { count: '~5万',  label: '种子 Q&A',        color: 'text-purple-600', op: '去重+质量分级扩展' },
+      { count: '~50万', label: '扩展+工具路由+对比', color: 'text-yellow-600', op: '质检+锚验+评分' },
+      { count: '~15万', label: '通过质检',          color: 'text-green-600',  op: '入库' },
+      { count: '~15万', label: '最终数据集',        color: 'text-gray-700',   op: '' },
     ];
     return { steps, dataFlow, templates, crossCount, stats };
   },
@@ -1436,7 +1949,7 @@ const pages = {
 
 createApp({
   setup() {
-    const currentPage   = ref('guide');
+    const currentPage   = ref('documents');
     const pipelineStatus = reactive({ is_running: false, steps: {} });
 
     let es = null;
@@ -1444,14 +1957,14 @@ createApp({
 
     async function pollStatus() {
       try {
-        const r = await fetch('/api/pipeline/status');
+        const r = await apiFetch('/api/pipeline/status');
         Object.assign(pipelineStatus, await r.json());
       } catch {}
     }
 
     function connectSSE() {
       if (es) es.close();
-      es = new EventSource('/api/pipeline/events');
+      es = new EventSource(apiUrl('/api/pipeline/events'));
       es.onmessage = (e) => {
         const ev = JSON.parse(e.data);
         if (ev.type === 'init') Object.assign(pipelineStatus, ev.state);
