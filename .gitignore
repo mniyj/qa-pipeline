@@ -20,3 +20,5 @@ data/qc_results/*
 data/final/*
 !data/final/.gitkeep
 .worktrees/
+.codebase-analysis.json
+.codebase-calls.json

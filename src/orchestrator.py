@@ -42,7 +42,10 @@ from expander import (
     expand_product_comparison, expand_misconception_batch,
     expand_tool_routing_rephrase, expand_clarification_refusal,
 )
-from quality_checker import run_full_qc, run_anchor_verify, run_llm_scoring
+from quality_checker import (
+    run_full_qc, run_anchor_verify, run_regulatory_anchor_verify, run_llm_scoring,
+    enrich_p2_source_metadata, split_p2_pools,
+)
 from param_extractor import extract_comparison_profiles
 from llm_client import usage_stats
 
@@ -230,34 +233,29 @@ def cmd_expand(config: dict, seed_file: str = None, limit: int = None, progress_
 
         logger.info(f"处理种子文件: {sf} ({len(seeds)} 条)")
         n = len(seeds)
-        total2 = _total_expand_seeds * 2  # rephrase + followup
 
-        def _make_cb(base_offset):
-            def cb(done, _total):
-                if progress_callback and total2 > 0:
-                    progress_callback(base_offset + done, total2)
-            return cb
+        # 3.1 + 3.2 改述变体 & 追问链并行执行（各自内部有 asyncio 事件循环）
+        logger.info("--- 并行启动改述扩展 + 追问链扩展 ---")
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        with _TPE(max_workers=2) as _pool:
+            _f_rephrase = _pool.submit(
+                expand_rephrase,
+                seeds, config, paths["expanded"],
+                num_variants=config["generation"]["expansion"]["rephrase_variants"],
+                limit=limit,
+            )
+            _f_followup = _pool.submit(
+                expand_followup,
+                seeds, config, paths["expanded"],
+                chain_length=config["generation"]["expansion"]["follow_up_depth"],
+                limit=limit,
+            )
+            _f_rephrase.result()
+            _f_followup.result()
 
-        # 3.1 改述变体（占 0→50% 区间）
-        logger.info("--- 开始改述扩展 ---")
-        expand_rephrase(
-            seeds, config, paths["expanded"],
-            num_variants=config["generation"]["expansion"]["rephrase_variants"],
-            limit=limit,
-            progress_callback=_make_cb(_expand_offset),
-        )
         if _stop_requested():
             logger.warning("⏹️ 收到停止请求，扩展步骤终止")
             break
-
-        # 3.2 追问链（占 50→100% 区间）
-        logger.info("--- 开始追问链扩展 ---")
-        expand_followup(
-            seeds, config, paths["expanded"],
-            chain_length=config["generation"]["expansion"]["follow_up_depth"],
-            limit=limit,
-            progress_callback=_make_cb(_expand_offset + _total_expand_seeds),
-        )
 
         _expand_offset += n
 
@@ -395,6 +393,7 @@ def cmd_p2_quality(config: dict, progress_callback=None) -> dict:
     paths = config["storage"]["paths"]
     expanded_dir = paths["expanded"]
     qc_dir = paths.get("qc_results", "./data/qc_results")
+    qcfg = config.get("quality_check", {})
 
     if progress_callback:
         progress_callback(10, 100)
@@ -421,16 +420,75 @@ def cmd_p2_quality(config: dict, progress_callback=None) -> dict:
                 if line.strip():
                     passed_qa.append(json.loads(line))
 
-        verify_passed, verify_flagged = run_anchor_verify(
-            passed_qa, paths["chunks"], config
+        enriched_qa = enrich_p2_source_metadata(passed_qa, paths["chunks"], config)
+        pools = split_p2_pools(enriched_qa, config)
+        pool_counts = {k: len(v) for k, v in pools.items()}
+        unknown_effective = sum(1 for qa in pools["unknown_docs"] if qa.get("effective_p2_pool") == "regulatory_docs")
+
+        product_pool = pools["product_docs"]
+        regulatory_pool = pools["regulatory_docs"] + [
+            qa for qa in pools["unknown_docs"] if qa.get("effective_p2_pool") == "regulatory_docs"
+        ]
+
+        verify_ckpt_product = str(Path(qc_dir) / "anchor_verify_product_checkpoint.json")
+        verify_product_passed, verify_product_flagged = run_anchor_verify(
+            product_pool,
+            paths["chunks"],
+            config,
+            llm_verify_rate=qcfg.get("product_verify_rate", 0.05),
+            checkpoint_file=verify_ckpt_product,
         )
-        logger.info(f"回溯校验: {len(verify_passed)} 通过, {len(verify_flagged)} 存疑")
+        verify_ckpt_reg = str(Path(qc_dir) / "anchor_verify_regulatory_checkpoint.json")
+        verify_reg_passed, verify_reg_flagged = run_regulatory_anchor_verify(
+            regulatory_pool,
+            paths["chunks"],
+            config,
+            llm_verify_rate=qcfg.get("regulatory_verify_rate", 0.01),
+            checkpoint_file=verify_ckpt_reg,
+        )
+
+        verify_passed = verify_product_passed + verify_reg_passed
+        verify_flagged = verify_product_flagged + verify_reg_flagged
+        verify_flagged_by_pool = {
+            "product_docs": len(verify_product_flagged),
+            "regulatory_docs": len(verify_reg_flagged),
+            "unknown_docs": sum(1 for qa in verify_reg_flagged if qa.get("p2_pool") == "unknown_docs"),
+        }
+        logger.info(
+            f"P2 分池回溯校验: 产品类 {len(verify_product_passed)} 通过/{len(verify_product_flagged)} 存疑 | "
+            f"规范类 {len(verify_reg_passed)} 通过/{len(verify_reg_flagged)} 存疑"
+        )
 
         if progress_callback:
             progress_callback(70, 100)
 
-        # Step 3: LLM 自动评分（抽样）
-        scoring_report = run_llm_scoring(verify_passed, config)
+        # Step 3: LLM 自动评分（按 pool / profile 抽样）
+        scoring_product_ckpt = str(Path(qc_dir) / "llm_scoring_product_checkpoint.json")
+        scoring_reg_ckpt = str(Path(qc_dir) / "llm_scoring_regulatory_checkpoint.json")
+        scoring_product_report = run_llm_scoring(
+            verify_product_passed,
+            config,
+            sample_rate=qcfg.get("product_scoring_rate", 0.05),
+            checkpoint_file=scoring_product_ckpt,
+            scoring_profile="product",
+        ) if verify_product_passed else {"sample_size": 0, "avg_scores": {}, "scoring_profile": "product"}
+        scoring_reg_report = run_llm_scoring(
+            verify_reg_passed,
+            config,
+            sample_rate=qcfg.get("regulatory_scoring_rate", 0.03),
+            checkpoint_file=scoring_reg_ckpt,
+            scoring_profile="regulatory",
+        ) if verify_reg_passed else {"sample_size": 0, "avg_scores": {}, "scoring_profile": "regulatory"}
+        scoring_report = {
+            "by_pool": {
+                "product_docs": scoring_product_report,
+                "regulatory_docs": scoring_reg_report,
+            },
+            "avg_scores_by_pool": {
+                "product_docs": scoring_product_report.get("avg_scores", {}),
+                "regulatory_docs": scoring_reg_report.get("avg_scores", {}),
+            },
+        }
 
         # 保存验证标记
         verify_file = Path(qc_dir) / "anchor_verify_flagged.jsonl"
@@ -441,9 +499,24 @@ def cmd_p2_quality(config: dict, progress_callback=None) -> dict:
         scoring_file = Path(qc_dir) / "llm_scoring_report.json"
         with open(scoring_file, "w", encoding="utf-8") as f:
             json.dump(scoring_report, f, ensure_ascii=False, indent=2)
+
+        p2_report = {
+            "p2_time": datetime.now().isoformat(),
+            "pool_counts": pool_counts,
+            "verify_flagged_by_pool": verify_flagged_by_pool,
+            "avg_scores_by_pool": scoring_report["avg_scores_by_pool"],
+            "unknown_doc_count": pool_counts.get("unknown_docs", 0),
+            "unknown_docs_routed_to_regulatory": unknown_effective,
+            "tool_routing_rephrase": rephrase_count,
+            "verify_passed_total": len(verify_passed),
+            "verify_flagged_total": len(verify_flagged),
+        }
+        with open(Path(qc_dir) / "p2_quality_report.json", "w", encoding="utf-8") as f:
+            json.dump(p2_report, f, ensure_ascii=False, indent=2)
     else:
         verify_flagged = []
         scoring_report = {}
+        pool_counts = {"product_docs": 0, "regulatory_docs": 0, "unknown_docs": 0}
 
     if progress_callback:
         progress_callback(100, 100)
@@ -451,7 +524,8 @@ def cmd_p2_quality(config: dict, progress_callback=None) -> dict:
     return {
         "tool_routing_rephrase": rephrase_count,
         "anchor_verify_flagged": len(verify_flagged),
-        "scoring_report": scoring_report.get("avg_scores", {}),
+        "pool_counts": pool_counts,
+        "avg_scores_by_pool": scoring_report.get("avg_scores_by_pool", {}),
     }
 
 

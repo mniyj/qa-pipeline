@@ -20,6 +20,7 @@ import asyncio
 import argparse
 import logging
 import threading
+from collections import defaultdict
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -120,6 +121,23 @@ def _retrieve_chunks(question: str, chunks: list[str], k: int = 5) -> list[str]:
         scored.append((score, chunk))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [c for _, c in scored[:k]]
+
+
+_REGULATORY_DOC_TYPES = frozenset({"法律法规", "监管文件", "行业标准"})
+_REGULATORY_SOURCE_KEYWORDS = re.compile(
+    r"法律法规|监管|行业标准|保险法|条例|办法|规定|通知|指引", re.IGNORECASE
+)
+
+
+def _is_regulatory_seed(seed: dict) -> bool:
+    """推断种子是否来自监管/法规类文档（用于选择扩展提示词）。
+    优先读取 doc_type 字段（新格式），缺失时从 source_doc 文件名推断。
+    """
+    doc_type = seed.get("doc_type", "")
+    if doc_type:
+        return doc_type in _REGULATORY_DOC_TYPES
+    source_doc = seed.get("source_doc", "")
+    return bool(source_doc and _REGULATORY_SOURCE_KEYWORDS.search(source_doc))
 
 
 def load_prompt(name: str) -> str:
@@ -237,7 +255,8 @@ async def _expand_rephrase_async(
     progress_callback=None,
 ) -> list[dict]:
     client = create_client(config, "expansion")
-    template = load_prompt("expand_rephrase")
+    template_product = load_prompt("expand_rephrase")
+    template_regulatory = load_prompt("expand_rephrase_regulatory")
     batch_id = f"rephrase_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     concurrency = config.get("generation", {}).get("expansion", {}).get("concurrency", 5)
     sem = asyncio.Semaphore(concurrency)
@@ -293,8 +312,9 @@ async def _expand_rephrase_async(
                     return i, []
 
                 logger.info(f"[改述 {i+1}/{len(pending)}] {question[:50]}...")
+                tmpl = template_regulatory if _is_regulatory_seed(seed) else template_product
                 prompt = _safe_format(
-                    template,
+                    tmpl,
                     num_variants=num_variants,
                     original_question=seed["question"],
                     original_answer=seed.get("answer", seed.get("summary", seed.get("description", ""))),
@@ -310,6 +330,10 @@ async def _expand_rephrase_async(
                         v["generation_method"] = "rephrase"
                         v["parent_id"] = seed_id
                         v["insurance_type"] = seed.get("insurance_type", "其他保险")
+                        if seed.get("doc_type"):
+                            v["doc_type"] = seed["doc_type"]
+                        v["source_chunk_id"] = seed.get("source_chunk_id", "")
+                        v["source_doc"] = seed.get("source_doc", "")
                         v["batch_id"] = batch_id
                         v["created_at"] = datetime.now().isoformat()
                     variants = [_normalize_qa(v) for v in variants]
@@ -320,8 +344,9 @@ async def _expand_rephrase_async(
                                 f.write(json.dumps(v, ensure_ascii=False) + "\n")
                         total_written += len(variants)
                         processed_ids.add(seed_id)
-                        with open(checkpoint_file, "w", encoding="utf-8") as mf:
-                            json.dump(list(processed_ids), mf, ensure_ascii=False)
+                        if len(processed_ids) % 100 == 0:
+                            with open(checkpoint_file, "w", encoding="utf-8") as mf:
+                                json.dump(list(processed_ids), mf, ensure_ascii=False)
                     logger.info(f"  → {len(variants)} 个变体（累计 {total_written}）")
                     return i, variants
                 except Exception as e:
@@ -335,6 +360,10 @@ async def _expand_rephrase_async(
     tasks = [process_one(i, seed) for i, seed in enumerate(pending)]
     raw = await asyncio.gather(*tasks)
     all_expanded = [item for _, variants in sorted(raw) for item in variants]
+
+    # 最终写入 checkpoint（确保不足 100 条的尾部也持久化）
+    with open(checkpoint_file, "w", encoding="utf-8") as mf:
+        json.dump(list(processed_ids), mf, ensure_ascii=False)
 
     # 保存报告（不覆盖 checkpoint 数据文件）
     report = {
@@ -378,7 +407,8 @@ async def _expand_followup_async(
     progress_callback=None,
 ) -> list[dict]:
     client = create_client(config, "expansion")
-    template = load_prompt("expand_followup")
+    template_product = load_prompt("expand_followup")
+    template_regulatory = load_prompt("expand_followup_regulatory")
     batch_id = f"followup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     concurrency = config.get("generation", {}).get("expansion", {}).get("concurrency", 5)
     sem = asyncio.Semaphore(concurrency)
@@ -431,8 +461,9 @@ async def _expand_followup_async(
                     return i, []
 
                 logger.info(f"[追问 {i+1}/{len(pending)}] {question[:50]}...")
+                tmpl = template_regulatory if _is_regulatory_seed(seed) else template_product
                 prompt = _safe_format(
-                    template,
+                    tmpl,
                     chain_length=chain_length,
                     original_question=seed["question"],
                     original_answer=seed.get("answer", seed.get("summary", seed.get("description", ""))),
@@ -447,6 +478,10 @@ async def _expand_followup_async(
                         t["generation_method"] = "followup"
                         t["parent_id"] = seed_id
                         t["insurance_type"] = seed.get("insurance_type", "其他保险")
+                        if seed.get("doc_type"):
+                            t["doc_type"] = seed["doc_type"]
+                        t["source_chunk_id"] = seed.get("source_chunk_id", "")
+                        t["source_doc"] = seed.get("source_doc", "")
                         t["batch_id"] = batch_id
                         t["created_at"] = datetime.now().isoformat()
                     turns = [_normalize_qa(t) for t in turns]
@@ -457,8 +492,9 @@ async def _expand_followup_async(
                                 f.write(json.dumps(t, ensure_ascii=False) + "\n")
                         total_written += len(turns)
                         processed_ids.add(seed_id)
-                        with open(checkpoint_file, "w", encoding="utf-8") as mf:
-                            json.dump(list(processed_ids), mf, ensure_ascii=False)
+                        if len(processed_ids) % 100 == 0:
+                            with open(checkpoint_file, "w", encoding="utf-8") as mf:
+                                json.dump(list(processed_ids), mf, ensure_ascii=False)
                     logger.info(f"  → {len(turns)} 轮追问（累计 {total_written}）")
                     return i, turns
                 except Exception as e:
@@ -472,6 +508,10 @@ async def _expand_followup_async(
     tasks = [process_one(i, seed) for i, seed in enumerate(pending)]
     raw = await asyncio.gather(*tasks)
     all_expanded = [item for _, turns in sorted(raw) for item in turns]
+
+    # 最终写入 checkpoint（确保不足 100 条的尾部也持久化）
+    with open(checkpoint_file, "w", encoding="utf-8") as mf:
+        json.dump(list(processed_ids), mf, ensure_ascii=False)
 
     report = {
         "batch_id": batch_id,
@@ -1506,8 +1546,11 @@ async def _generate_comparison_qa(
             logger.warning(f"对比中间态生成失败 ({product_a} vs {product_b}): {e}")
             return []
 
-    comp_intermediate = parse_json(comp_response)
-    if not comp_intermediate:
+    _parsed = parse_json(comp_response)
+    if not _parsed:
+        return []
+    comp_intermediate = _parsed[0] if isinstance(_parsed, list) else _parsed
+    if not isinstance(comp_intermediate, dict):
         return []
 
     # 检查敏感维度 → 产出工具路由对比 Q&A

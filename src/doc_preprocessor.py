@@ -276,6 +276,12 @@ def classify_document_with_llm(
             logger.warning(f"product_name '{product_name}' 未在前500字出现，丢弃")
             product_name = ""
 
+        # 监管类文档不应有产品名，强制清空防止后续误用
+        _REGULATORY_DOC_TYPES = {"法律法规", "监管文件", "行业标准"}
+        if doc_type in _REGULATORY_DOC_TYPES and product_name:
+            logger.info(f"监管类文档 '{file_name}' 清除 product_name: {product_name}")
+            product_name = ""
+
     except Exception as e:
         logger.warning(f"LLM 分类失败 ({file_name}): {e}，使用正则结果")
         doc_type, ins_type, product_name = fallback_doc, fallback_ins, ""
@@ -529,19 +535,38 @@ def process_all_documents(
     failed_files = []
 
     cache = _load_classification_cache(str(output_path))
+    doc_concurrency = config.get("preprocessing", {}).get("doc_concurrency", 8)
 
-    for idx, (file_path, md5) in enumerate(new_files):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+    _cache_lock = threading.Lock()
+    _progress_count = 0
+    _progress_lock = threading.Lock()
+
+    def _process_one(file_path_md5):
+        file_path, md5 = file_path_md5
         try:
             meta, chunks = process_single_document(str(file_path), config, cache)
-            if meta:
-                all_metas.append(asdict(meta))
-                all_chunks.extend([asdict(c) for c in chunks])
-                manifest[md5] = meta.file_name
+            return md5, meta, chunks, None
         except Exception as e:
             logger.error(f"处理失败: {file_path}, 错误: {e}")
-            failed_files.append({"file": str(file_path), "error": str(e)})
-        if progress_callback:
-            progress_callback(idx + 1, len(new_files))
+            return md5, None, [], str(e)
+
+    with ThreadPoolExecutor(max_workers=doc_concurrency) as executor:
+        futures = {executor.submit(_process_one, item): item for item in new_files}
+        for future in as_completed(futures):
+            nonlocal_md5, meta, chunks, err = future.result()
+            if err:
+                failed_files.append({"file": str(futures[future][0]), "error": err})
+            elif meta:
+                all_metas.append(asdict(meta))
+                all_chunks.extend([asdict(c) for c in chunks])
+                with _cache_lock:
+                    manifest[nonlocal_md5] = meta.file_name
+            if progress_callback:
+                with _progress_lock:
+                    _progress_count += 1
+                    progress_callback(_progress_count, len(new_files))
 
     # 追加新 chunks，跳过 chunk_id 已存在的（防止同一文件被 preprocess 重复写入）
     chunks_file = output_path / "chunks.jsonl"

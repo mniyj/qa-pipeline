@@ -259,6 +259,7 @@ async def _generate_seeds_async(
                         qa["id"] = f"{batch_id}_{chunk['chunk_id']}_{j:03d}"
                         qa["source_chunk_id"] = chunk["chunk_id"]
                         qa["source_doc"] = chunk["doc_file"]
+                        qa["doc_type"] = doc_type
                         qa["insurance_type"] = chunk["insurance_type"]
                         qa["product_name"] = chunk.get("product_name", "")
                         qa["generation_method"] = "seed_from_document"
