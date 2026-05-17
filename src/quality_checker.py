@@ -614,32 +614,50 @@ def _check_facts(qa: dict) -> list[str]:
 
 
 # ============================================================
-# Stage 4: 覆盖率分析
+# Stage 4: 覆盖率分析（三维 + 工具路由 + qa_category）
 # ============================================================
 def run_coverage_analysis(qa_list: list[dict], config: dict) -> dict:
-    """分析知识坐标覆盖情况"""
+    """分析知识坐标三维覆盖情况 + 工具路由覆盖 + qa_category 分布"""
     schema = config.get("knowledge_schema", {})
 
     all_types = schema.get("insurance_types", [])
-
-    stages = schema.get("business_stages", [])
+    stages = schema.get("business_stages", [
+        "投保咨询", "健康告知", "核保", "承保生效",
+        "保全变更", "续保复效", "报案", "理赔材料",
+        "理赔审核", "赔付结案", "拒赔争议", "通用",
+    ])
     qtypes = schema.get("question_types", [])
 
-    # 统计
-    coverage = defaultdict(int)
+    # 三维覆盖：insurance_type × business_stage × question_type
+    coverage_3d: dict[tuple, int] = defaultdict(int)
+    coverage_2d: dict[tuple, int] = defaultdict(int)  # insurance_type × question_type
+    by_insurance: dict[str, int] = defaultdict(int)
+    by_stage: dict[str, int] = defaultdict(int)
+    by_qtype: dict[str, int] = defaultdict(int)
+    by_category: dict[str, int] = defaultdict(int)
+    by_tool: dict[str, int] = defaultdict(int)
+
     for qa in qa_list:
         ins = qa.get("insurance_type", "未知")
+        stage = qa.get("business_stage", "通用")
         qtype = qa.get("question_type", "未知")
-        coverage[(ins, qtype)] += 1
+        category = qa.get("qa_category", "knowledge")
+        tool = qa.get("tool_routing", "")
 
-    # 生成报告
-    gaps = []
-    weak = []
-    strong = []
+        coverage_3d[(ins, stage, qtype)] += 1
+        coverage_2d[(ins, qtype)] += 1
+        by_insurance[ins] += 1
+        by_stage[stage] += 1
+        by_qtype[qtype] += 1
+        by_category[category] += 1
+        if tool:
+            by_tool[tool] += 1
 
+    # 二维空白/薄弱分析（insurance_type × question_type）
+    gaps, weak, strong = [], [], []
     for ins in all_types:
         for qtype in qtypes:
-            count = coverage.get((ins, qtype), 0)
+            count = coverage_2d.get((ins, qtype), 0)
             coord = {"insurance_type": ins, "question_type": qtype, "count": count}
             if count == 0:
                 gaps.append(coord)
@@ -648,21 +666,35 @@ def run_coverage_analysis(qa_list: list[dict], config: dict) -> dict:
             elif count > 50:
                 strong.append(coord)
 
-    # 按险种聚合
-    by_insurance = defaultdict(int)
-    for qa in qa_list:
-        by_insurance[qa.get("insurance_type", "未知")] += 1
+    # 工具路由覆盖情况
+    required_tools = {"underwriting_check", "premium_calculator", "cash_value_query",
+                      "claim_calculator", "account_query"}
+    tool_coverage = {tool: by_tool.get(tool, 0) for tool in required_tools}
+    missing_tools = [t for t, cnt in tool_coverage.items() if cnt == 0]
 
-    # 按问题类型聚合
-    by_qtype = defaultdict(int)
-    for qa in qa_list:
-        by_qtype[qa.get("question_type", "未知")] += 1
+    # 产品对比覆盖（白名单）
+    from param_extractor import COMPARISON_WHITELIST
+    comparison_coverage = {}
+    for type_a, type_b, comp_type in COMPARISON_WHITELIST:
+        key = f"{type_a} vs {type_b}"
+        count = sum(
+            1 for qa in qa_list
+            if qa.get("qa_category") == "product_comparison"
+            and type_a in qa.get("insurance_type", "")
+            and type_b in qa.get("insurance_type", "")
+        )
+        comparison_coverage[key] = count
 
     report = {
         "total_qa": len(qa_list),
         "coverage_by_insurance_type": dict(by_insurance),
+        "coverage_by_business_stage": dict(by_stage),
         "coverage_by_question_type": dict(by_qtype),
-        "gaps": gaps[:50],      # 空白坐标（最多显示 50 个）
+        "qa_category_distribution": dict(by_category),
+        "tool_routing_coverage": tool_coverage,
+        "missing_tools": missing_tools,
+        "comparison_whitelist_coverage": comparison_coverage,
+        "gaps": gaps[:50],
         "weak_spots": weak[:50],
         "strong_spots": strong[:20],
         "gap_count": len(gaps),
@@ -670,9 +702,233 @@ def run_coverage_analysis(qa_list: list[dict], config: dict) -> dict:
     }
 
     logger.info(
-        f"覆盖率: 总 {len(qa_list)} 条 | "
-        f"空白坐标 {len(gaps)} | 薄弱坐标 {len(weak)}"
+        f"覆盖率(三维): 总 {len(qa_list)} 条 | "
+        f"空白坐标 {len(gaps)} | 薄弱坐标 {len(weak)} | "
+        f"qa_category={dict(by_category)}"
     )
+    return report
+
+
+# ============================================================
+# Stage 5: 分层答案回溯校验（P2）
+# ============================================================
+
+def _build_chunks_index(qa_list: list[dict], chunks_dir: str) -> dict[str, str]:
+    """从 chunks.jsonl 构建 chunk_id → text 索引"""
+    chunks_file = Path(chunks_dir) / "chunks.jsonl"
+    index: dict[str, str] = {}
+    if not chunks_file.exists():
+        return index
+    with open(chunks_file, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                chunk = json.loads(line)
+                index[chunk.get("chunk_id", "")] = chunk.get("text", "")
+    return index
+
+
+def anchor_verify(qa: dict, chunks_index: dict[str, str]) -> list[str]:
+    """
+    第一级回溯校验：检查答案中的数字是否出现在来源 chunk 中。
+    工具路由型条目跳过（答案是模板，无需核验）。
+    """
+    if qa.get("is_tool_routed"):
+        return []
+    issues = []
+    answer = qa.get("answer", "")
+    chunk_id = qa.get("source_chunk_id", "")
+    if not chunk_id or chunk_id not in chunks_index:
+        return []
+    source_text = chunks_index[chunk_id]
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*(万)?\s*(元|天|日|年|%|个月)", answer):
+        val_str = m.group(0).replace(" ", "")
+        if val_str not in source_text and m.group(0) not in source_text:
+            issues.append(f"'{val_str}' 未在来源 chunk 中找到")
+    return issues
+
+
+def _is_high_risk_qa(qa: dict, anchor_issues: list[str]) -> bool:
+    """判断是否为高风险条目，需要进行 LLM 二级校验"""
+    if anchor_issues:
+        return True
+    answer = qa.get("answer", "")
+    num_count = len(re.findall(r"\d+(?:\.\d+)?(?:\s*(?:万|元|天|%|年))", answer))
+    if num_count >= 3:
+        return True
+    gen_method = qa.get("generation_method", "")
+    if "followup" in gen_method and qa.get("parent_id"):
+        chain_depth = qa.get("chain_depth", 0)
+        if chain_depth >= 3:
+            return True
+    return False
+
+
+async def _llm_verify_one(qa: dict, chunks_index: dict[str, str], client, template: str, sem: asyncio.Semaphore) -> dict:
+    """对单条高风险 Q&A 做 LLM 二级校验"""
+    chunk_id = qa.get("source_chunk_id", "")
+    source_text = chunks_index.get(chunk_id, "（来源文档内容不可用）")
+    async with sem:
+        prompt = template.format(
+            source_text=source_text[:2000],
+            question=qa.get("question", ""),
+            answer=qa.get("answer", ""),
+        )
+        try:
+            from llm_client import create_client as _create_client
+            response = await client.acall(prompt)
+            response = re.sub(r"```(?:json)?\s*", "", response).strip()
+            result = json.loads(response)
+            return {"qa_id": qa.get("id", ""), "verdict": result.get("verdict", "pass"),
+                    "issues": result.get("issues", []), "hallucination_risk": result.get("hallucination_risk", "low")}
+        except Exception as e:
+            return {"qa_id": qa.get("id", ""), "verdict": "pass", "issues": [], "error": str(e)}
+
+
+def run_anchor_verify(
+    qa_list: list[dict],
+    chunks_dir: str,
+    config: dict,
+    llm_verify_rate: float = 0.05,
+) -> tuple[list[dict], list[dict]]:
+    """
+    分层答案回溯校验：
+    Level 1（零成本）: 锚点数字校验
+    Level 2（~5% LLM）: 高风险条目 LLM 核验
+    返回 (通过列表, 存疑列表)
+    """
+    chunks_index = _build_chunks_index(qa_list, chunks_dir)
+    if not chunks_index:
+        logger.info("未找到 chunks 索引，跳过锚点校验")
+        return qa_list, []
+
+    level1_issues: dict[str, list[str]] = {}
+    for qa in qa_list:
+        issues = anchor_verify(qa, chunks_index)
+        if issues:
+            level1_issues[qa.get("id", "")] = issues
+
+    logger.info(f"锚点校验: {len(level1_issues)} 条发现数字不一致")
+
+    # 识别高风险条目（Level 1 问题 + 其他判断）
+    high_risk = [qa for qa in qa_list if _is_high_risk_qa(qa, level1_issues.get(qa.get("id", ""), []))]
+    sample_size = max(1, int(len(qa_list) * llm_verify_rate))
+    llm_verify_targets = high_risk[:sample_size]
+
+    logger.info(f"LLM 二级校验: {len(llm_verify_targets)}/{len(qa_list)} 条（高风险抽样）")
+
+    # LLM 二级校验（异步）
+    llm_results: dict[str, dict] = {}
+    if llm_verify_targets:
+        try:
+            import asyncio as _asyncio
+            from llm_client import create_client as _create_client
+            verify_template = (Path(__file__).parent.parent / "prompts" / "verify_answer.txt").read_text(encoding="utf-8")
+            client = _create_client(config, "quality_check")
+            sem = _asyncio.Semaphore(3)
+
+            async def _run_llm_verify():
+                tasks = [_llm_verify_one(qa, chunks_index, client, verify_template, sem) for qa in llm_verify_targets]
+                return await _asyncio.gather(*tasks)
+
+            results = asyncio.run(_run_llm_verify())
+            for r in results:
+                llm_results[r["qa_id"]] = r
+        except Exception as e:
+            logger.warning(f"LLM 二级校验失败: {e}")
+
+    passed, flagged = [], []
+    for qa in qa_list:
+        qa_id = qa.get("id", "")
+        l1_issues = level1_issues.get(qa_id, [])
+        llm_result = llm_results.get(qa_id, {})
+        llm_issues = llm_result.get("issues", []) if llm_result.get("verdict") == "flag" else []
+        all_issues = l1_issues + llm_issues
+        if all_issues:
+            qa["_verify_issues"] = all_issues
+            flagged.append(qa)
+        else:
+            passed.append(qa)
+
+    logger.info(f"回溯校验: {len(passed)} 通过, {len(flagged)} 存疑")
+    return passed, flagged
+
+
+# ============================================================
+# Stage 6: LLM 自动评分（P2，抽样层）
+# ============================================================
+
+LLM_SCORING_PROMPT = """你是保险知识库质检专家，请对以下问答对进行质量评分。
+
+## 问答对
+问题：{question}
+答案：{answer}
+险种：{insurance_type}
+问题类型：{question_type}
+
+## 评分维度（各1-5分）
+1. 准确性：答案是否正确，无明显错误
+2. 完整性：答案是否完整覆盖问题要点
+3. 实用性：答案对用户的实际帮助程度
+4. 专业性：术语使用是否准确恰当
+5. 清晰度：答案是否易于理解
+
+只输出 JSON，不要其他说明：
+{{"accuracy": 4, "completeness": 3, "practicality": 5, "professionalism": 4, "clarity": 4, "overall": 4.0, "comment": "一句话点评"}}
+"""
+
+
+def run_llm_scoring(
+    qa_list: list[dict],
+    config: dict,
+    sample_rate: float = 0.05,
+) -> dict:
+    """对质检通过的 Q&A 抽样进行 LLM 五维评分"""
+    import random
+    sample_size = max(1, int(len(qa_list) * sample_rate))
+    sample = random.sample(qa_list, min(sample_size, len(qa_list)))
+
+    logger.info(f"LLM 自动评分: 从 {len(qa_list)} 条中抽取 {len(sample)} 条评分")
+
+    from llm_client import create_client
+    client = create_client(config, "quality_check")
+
+    scores = []
+    for qa in sample:
+        try:
+            prompt = LLM_SCORING_PROMPT.format(
+                question=qa.get("question", ""),
+                answer=qa.get("answer", ""),
+                insurance_type=qa.get("insurance_type", ""),
+                question_type=qa.get("question_type", ""),
+            )
+            response = client.call(prompt)
+            response = re.sub(r"```(?:json)?\s*", "", response).strip()
+            result = json.loads(response)
+            result["qa_id"] = qa.get("id", "")
+            scores.append(result)
+        except Exception as e:
+            logger.warning(f"评分失败 ({qa.get('id', '')}): {e}")
+            continue
+
+    if not scores:
+        return {"sample_size": 0, "avg_scores": {}}
+
+    dims = ["accuracy", "completeness", "practicality", "professionalism", "clarity", "overall"]
+    avg_scores = {}
+    for dim in dims:
+        vals = [s[dim] for s in scores if isinstance(s.get(dim), (int, float))]
+        avg_scores[dim] = round(sum(vals) / len(vals), 2) if vals else 0.0
+
+    report = {
+        "sample_size": len(scores),
+        "total_qa": len(qa_list),
+        "sample_rate": f"{len(scores)/len(qa_list):.1%}",
+        "avg_scores": avg_scores,
+        "low_quality_count": sum(1 for s in scores if s.get("overall", 5) < 3),
+        "scores": scores,
+    }
+
+    logger.info(f"LLM 评分完成: 均分 {avg_scores.get('overall', 0):.2f}/5.0")
     return report
 
 

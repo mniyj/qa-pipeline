@@ -36,8 +36,14 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 
 from doc_preprocessor import process_all_documents
 from seed_generator import generate_seeds_from_chunks
-from expander import expand_rephrase, expand_followup, expand_template, load_seeds, expand_tool_routing, expand_policy_service
-from quality_checker import run_full_qc
+from expander import (
+    expand_rephrase, expand_followup, expand_template, load_seeds,
+    expand_tool_routing, expand_policy_service,
+    expand_product_comparison, expand_misconception_batch,
+    expand_tool_routing_rephrase, expand_clarification_refusal,
+)
+from quality_checker import run_full_qc, run_anchor_verify, run_llm_scoring
+from param_extractor import extract_comparison_profiles
 from llm_client import usage_stats
 
 logger = logging.getLogger(__name__)
@@ -331,6 +337,125 @@ def cmd_qc(config: dict, input_files: list[str] = None, progress_callback=None):
 
 
 # ============================================================
+# Step 3d: 产品对比画像提取 + 对比 Q&A 生成
+# ============================================================
+def cmd_comparison(config: dict, progress_callback=None) -> dict:
+    """提取文档对比画像，生成产品对比型 Q&A"""
+    paths = config["storage"]["paths"]
+    chunks_file = Path(paths["chunks"]) / "chunks.jsonl"
+
+    if not chunks_file.exists():
+        logger.warning("chunks.jsonl 不存在，跳过对比画像提取")
+        return {}
+
+    if progress_callback:
+        progress_callback(10, 100)
+
+    # Step 1: 提取对比画像
+    profiles = extract_comparison_profiles(str(chunks_file), paths["chunks"], config)
+    logger.info(f"对比画像提取完成: {len(profiles)} 个文档")
+
+    if progress_callback:
+        progress_callback(40, 100)
+
+    # Step 2: 生成产品对比 Q&A
+    profiles_file = Path(paths["chunks"]) / "doc_comparison_profiles.jsonl"
+    comparison_qa = expand_product_comparison(str(profiles_file), config, paths["expanded"])
+
+    if progress_callback:
+        progress_callback(80, 100)
+
+    # Step 3: 生成误解纠正型 Q&A
+    misconception_qa = expand_misconception_batch(config, paths["expanded"])
+
+    # Step 4: 生成澄清/拒答 Q&A
+    clarification_qa = expand_clarification_refusal(paths["expanded"])
+
+    if progress_callback:
+        progress_callback(100, 100)
+
+    total = len(comparison_qa) + len(misconception_qa) + len(clarification_qa)
+    logger.info(
+        f"P1 扩展完成: 对比 {len(comparison_qa)} + 误解纠正 {len(misconception_qa)} "
+        f"+ 澄清/拒答 {len(clarification_qa)} = {total} 条"
+    )
+    return {
+        "comparison_count": len(comparison_qa),
+        "misconception_count": len(misconception_qa),
+        "clarification_count": len(clarification_qa),
+        "total": total,
+    }
+
+
+# ============================================================
+# Step 3e: P2 精细质量增强
+# ============================================================
+def cmd_p2_quality(config: dict, progress_callback=None) -> dict:
+    """P2 质量增强：工具路由改述扩展 + 分层答案回溯校验 + LLM 评分"""
+    paths = config["storage"]["paths"]
+    expanded_dir = paths["expanded"]
+    qc_dir = paths.get("qc_results", "./data/qc_results")
+
+    if progress_callback:
+        progress_callback(10, 100)
+
+    # Step 1: 工具路由问题改述扩展
+    tool_routing_files = sorted(
+        [str(f) for f in Path(expanded_dir).glob("tool_routing_*.jsonl")]
+    )
+    rephrase_count = 0
+    for tr_file in tool_routing_files:
+        results = expand_tool_routing_rephrase(tr_file, config, expanded_dir)
+        rephrase_count += len(results)
+    logger.info(f"工具路由改述: 生成 {rephrase_count} 条")
+
+    if progress_callback:
+        progress_callback(40, 100)
+
+    # Step 2: 分层答案回溯校验（对已通过质检的数据）
+    passed_file = Path(qc_dir) / "qa_passed.jsonl"
+    if passed_file.exists():
+        passed_qa = []
+        with open(passed_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    passed_qa.append(json.loads(line))
+
+        verify_passed, verify_flagged = run_anchor_verify(
+            passed_qa, paths["chunks"], config
+        )
+        logger.info(f"回溯校验: {len(verify_passed)} 通过, {len(verify_flagged)} 存疑")
+
+        if progress_callback:
+            progress_callback(70, 100)
+
+        # Step 3: LLM 自动评分（抽样）
+        scoring_report = run_llm_scoring(verify_passed, config)
+
+        # 保存验证标记
+        verify_file = Path(qc_dir) / "anchor_verify_flagged.jsonl"
+        with open(verify_file, "a", encoding="utf-8") as f:
+            for qa in verify_flagged:
+                f.write(json.dumps(qa, ensure_ascii=False) + "\n")
+
+        scoring_file = Path(qc_dir) / "llm_scoring_report.json"
+        with open(scoring_file, "w", encoding="utf-8") as f:
+            json.dump(scoring_report, f, ensure_ascii=False, indent=2)
+    else:
+        verify_flagged = []
+        scoring_report = {}
+
+    if progress_callback:
+        progress_callback(100, 100)
+
+    return {
+        "tool_routing_rephrase": rephrase_count,
+        "anchor_verify_flagged": len(verify_flagged),
+        "scoring_report": scoring_report.get("avg_scores", {}),
+    }
+
+
+# ============================================================
 # 状态查看
 # ============================================================
 def cmd_status(config: dict):
@@ -442,6 +567,10 @@ def cmd_run(config: dict, seed_limit: int = None, expand_limit: int = None):
     logger.info("=" * 40 + " Step 3c: 工具路由型 Q&A 生成 " + "=" * 40)
     cmd_tool_routing(config)
 
+    # Step 3d: 产品对比 + 误解纠正 + 澄清/拒答
+    logger.info("=" * 40 + " Step 3d: 产品对比/误解纠正/澄清拒答 " + "=" * 40)
+    cmd_comparison(config)
+
     # Step 4
     logger.info("=" * 40 + " Step 4: 质量检查 " + "=" * 40)
     cmd_qc(config)
@@ -471,7 +600,10 @@ def main():
   python src/orchestrator.py run --seed-limit 3   # 全流程试跑
         """
     )
-    parser.add_argument("command", choices=["run", "preprocess", "seed", "seed-dedup", "expand", "expand-template", "tool-routing", "qc", "status"])
+    parser.add_argument("command", choices=[
+        "run", "preprocess", "seed", "seed-dedup", "expand", "expand-template",
+        "tool-routing", "comparison", "p2-quality", "qc", "status",
+    ])
     parser.add_argument("--config", default="./config/config.yaml")
     parser.add_argument("--limit", type=int, default=None, help="限制处理数量")
     parser.add_argument("--seed-limit", type=int, default=None, help="种子阶段限制chunk数")
@@ -501,6 +633,10 @@ def main():
         )
     elif args.command == "tool-routing":
         cmd_tool_routing(config)
+    elif args.command == "comparison":
+        cmd_comparison(config)
+    elif args.command == "p2-quality":
+        cmd_p2_quality(config)
     elif args.command == "qc":
         cmd_qc(config, input_files=args.input)
     elif args.command == "run":

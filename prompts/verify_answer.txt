@@ -1,0 +1,32 @@
+你是保险知识质检专家。请对以下问答对进行事实准确性验证。
+
+## 来源文档内容
+<source>
+{source_text}
+</source>
+
+## 待验证的问答对
+问题：{question}
+答案：{answer}
+
+## 验证要求
+
+请检查答案中的关键信息是否与来源文档一致：
+1. 数字/金额是否准确（天数、元、%等）
+2. 条款引用是否正确
+3. 流程/条件描述是否与文档一致
+4. 是否存在文档未提及但答案声称的信息
+
+只输出 JSON，不要其他说明：
+{{
+  "verdict": "pass|flag",
+  "confidence": "high|medium|low",
+  "issues": ["问题描述1", "问题描述2"],
+  "hallucination_risk": "high|medium|low",
+  "specific_errors": [
+    {{
+      "claim": "答案中的声明",
+      "evidence": "来源文档中的对应内容或'未找到依据'"
+    }}
+  ]
+}}

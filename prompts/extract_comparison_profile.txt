@@ -1,0 +1,59 @@
+你是资深保险产品分析专家，擅长从保险条款文档中提取结构化产品特征。
+
+请根据以下文档内容，提取该保险产品的对比画像（comparison profile）。
+
+## 文档信息
+- 文件名：{doc_file}
+- 险种：{insurance_type}
+- 产品名：{product_name}
+
+## 文档内容
+<document>
+{document_content}
+</document>
+
+## 提取要求
+
+【证据优先原则】
+- 所有字段必须有文档中的明确依据
+- 没有文档证据的字段一律填 "未知"
+- 禁止凭行业经验推断（例如：不能因为是重疾险就推断等待期90天）
+- 宁可少填，不可错填
+
+【字段说明】
+- benefit_type: 只能是"给付型|报销型|津贴型|账户型|赔偿型|未知"之一
+- cash_value: 只能是"有|无|不适用|未知"之一
+- premium_pattern: 只能是"均衡保费|自然费率|趸交|未知"之一
+- waiting_period: 有明确天数才填（如"90天"），否则填"未知"
+- deductible: 有明确金额才填（如"10000元"），否则填"未知"
+- sensitive_compare_fields: 列出哪些维度的对比需要走工具路由（如保费、退保金、核保条件）
+
+只输出 JSON，不要其他说明：
+{{
+  "product_name": "{product_name}",
+  "insurance_type": "{insurance_type}",
+  "product_category": "险种大类（如疾病险、医疗险、寿险等）",
+  "product_positioning": "一句话描述产品定位",
+  "benefit_type": "给付型|报销型|津贴型|账户型|赔偿型|未知",
+  "coverage_scope": "保障范围摘要（50字内）",
+  "claim_trigger": "赔付触发条件",
+  "payment_basis": "赔付依据（定额/实报实销/比例）",
+  "renewal_rule": "续保规则",
+  "coverage_term": "保障期限",
+  "waiting_period": "等待期天数或'未知'",
+  "deductible": "免赔额或'未知'",
+  "cash_value": "有|无|不适用|未知",
+  "premium_pattern": "均衡保费|自然费率|趸交|未知",
+  "target_population": "适用人群",
+  "key_exclusions": ["除外责任1", "除外责任2"],
+  "coordination_rule": "与其他险种协调规则",
+  "replaceability_hint": "可替代性提示",
+  "combo_purchase_hint": "组合配置建议",
+  "sensitive_compare_fields": ["保费", "退保金额"],
+  "source_evidence": {{
+    "benefit_type": "文档第X段原文或'无依据'",
+    "waiting_period": "文档第X段原文或'无依据'",
+    "deductible": "文档第X段原文或'无依据'",
+    "cash_value": "文档第X段原文或'无依据'"
+  }}
+}}

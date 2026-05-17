@@ -28,6 +28,41 @@ import yaml
 from llm_client import create_client, usage_stats
 from dedup import DedupTracker
 
+# ============================================================
+# 保险领域同义词词典（用于问题改写时的词汇多样化）
+# ============================================================
+INSURANCE_SYNONYMS = {
+    "犹豫期": ["冷静期", "撤单期"],
+    "等待期": ["观察期", "免责期"],
+    "免赔额": ["起付线", "自负额"],
+    "退保": ["解约", "退保金"],
+    "现金价值": ["退保金", "解约金"],
+    "如实告知": ["健康告知", "投保告知"],
+    "代位求偿": ["代位追偿"],
+    "豁免": ["保费豁免"],
+    "保额": ["保险金额", "基本保额"],
+    "受益人": ["保险金受领人"],
+    "宽限期": ["缴费宽限期"],
+    "复效": ["保单复效", "效力恢复"],
+    "重疾险": ["重大疾病保险"],
+    "百万医疗险": ["住院医疗险", "医疗保险"],
+    "定期寿险": ["定寿"],
+    "意外险": ["意外伤害保险"],
+    "理赔": ["索赔", "申请赔付"],
+    "核保": ["健康审核", "承保审核"],
+}
+
+
+def apply_synonym_variation(text: str) -> str:
+    """随机替换文本中的保险术语为同义词，增加语言多样性"""
+    import random
+    for term, synonyms in INSURANCE_SYNONYMS.items():
+        if term in text and random.random() < 0.3:
+            replacement = random.choice(synonyms)
+            text = text.replace(term, replacement, 1)
+    return text
+
+
 _stop_event: threading.Event | None = None
 
 
@@ -1406,6 +1441,505 @@ def expand_misconception_batch(config: dict, output_dir: str) -> list[dict]:
             f.write(json.dumps(qa, ensure_ascii=False) + "\n")
 
     logger.info(f"误解纠正型 Q&A 生成完成: {len(results)} 条 → {out_file}")
+    return results
+
+
+# ============================================================
+# 产品对比型 Q&A 生成（P1）
+# ============================================================
+
+# 高频对比问题模板
+_COMPARISON_QUESTION_TEMPLATES = {
+    "cross_category": [
+        "{a}和{b}有什么区别？各自适合什么人？",
+        "{a}和{b}应该怎么选？",
+        "{a}和{b}能相互替代吗？",
+        "{a}和{b}可以同时购买吗？有什么搭配建议？",
+        "我已经有了{a}，还需要买{b}吗？",
+    ],
+    "same_category": [
+        "{a}和{b}有什么区别？哪个更适合我？",
+        "同样是寿险，{a}和{b}怎么选？",
+        "{a}和{b}各有什么优缺点？",
+    ],
+    "replaceability": [
+        "有了{a}还需要{b}吗？",
+        "{a}可以代替{b}吗？",
+    ],
+}
+
+
+async def _generate_comparison_qa(
+    profile_a: dict,
+    profile_b: dict,
+    comparison_type: str,
+    client,
+    comp_template: str,
+    render_template: str,
+    sem: asyncio.Semaphore,
+    batch_id: str,
+    idx: int,
+) -> list[dict]:
+    """生成单个对比组合的 Q&A 列表"""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from param_extractor import SENSITIVE_COMPARISON_ROUTES
+
+    product_a = profile_a.get("product_name") or profile_a.get("insurance_type", "产品A")
+    product_b = profile_b.get("product_name") or profile_b.get("insurance_type", "产品B")
+    created_at = datetime.now().isoformat()
+
+    results = []
+
+    async with sem:
+        # Step 1: 生成结构化对比中间态
+        comp_prompt = comp_template.format(
+            profile_a=json.dumps(profile_a, ensure_ascii=False, indent=2),
+            profile_b=json.dumps(profile_b, ensure_ascii=False, indent=2),
+            comparison_type=comparison_type,
+            product_a_name=product_a,
+            product_b_name=product_b,
+        )
+        try:
+            comp_response = await client.acall(comp_prompt)
+        except Exception as e:
+            logger.warning(f"对比中间态生成失败 ({product_a} vs {product_b}): {e}")
+            return []
+
+    comp_intermediate = parse_json(comp_response)
+    if not comp_intermediate:
+        return []
+
+    # 检查敏感维度 → 产出工具路由对比 Q&A
+    sensitive_dims = comp_intermediate.get("sensitive_dimensions", [])
+    for dim in sensitive_dims:
+        tool = SENSITIVE_COMPARISON_ROUTES.get(dim)
+        if tool:
+            question = f"{product_a}和{product_b}哪个{dim.replace('对比', '')}更便宜/合算？"
+            answer = (
+                f"{product_a}和{product_b}的{dim.replace('对比', '')}受多种因素影响，"
+                f"无法直接比较。建议通过{dim.replace('对比', '')}计算工具，"
+                f"分别输入您的具体信息获取精确数据后再做比较。"
+            )
+            results.append({
+                "id": f"{batch_id}_{idx:04d}_sensitive_{len(results)}",
+                "question": question,
+                "answer": answer,
+                "qa_category": "product_comparison",
+                "insurance_type": f"{profile_a.get('insurance_type', '')}/{profile_b.get('insurance_type', '')}",
+                "product_name": "",
+                "business_stage": "投保咨询",
+                "question_type": "产品对比",
+                "difficulty": "入门",
+                "comparison_type": "tool_routed_comparison",
+                "product_a": product_a,
+                "product_b": product_b,
+                "comparison_dimensions": [],
+                "comparison_verdict": answer,
+                "comparison_limitations": f"涉及{dim}，需通过工具获取精确信息",
+                "is_tool_routed": True,
+                "tool_routing": tool,
+                "tool_params": {"product_a": product_a, "product_b": product_b},
+                "requires_clarification": False,
+                "misconception": "",
+                "source_chunk_id": "",
+                "source_doc": "",
+                "source_reference": "",
+                "parent_id": "",
+                "generation_method": "product_comparison_tool_routed",
+                "batch_id": batch_id,
+                "created_at": created_at,
+                "tags": ["产品对比", "工具路由", product_a, product_b],
+            })
+
+    # Step 2: 渲染自然语言答案
+    question_templates = _COMPARISON_QUESTION_TEMPLATES.get(comparison_type, _COMPARISON_QUESTION_TEMPLATES["cross_category"])
+    for q_tpl in question_templates[:3]:
+        question = q_tpl.format(a=product_a, b=product_b)
+        async with sem:
+            render_prompt = render_template.format(
+                question=question,
+                comparison_intermediate=json.dumps(comp_intermediate, ensure_ascii=False, indent=2),
+            )
+            try:
+                answer = await client.acall(render_prompt)
+                answer = answer.strip()
+            except Exception as e:
+                logger.warning(f"对比答案渲染失败: {e}")
+                continue
+
+        if len(answer) < 50:
+            continue
+
+        results.append({
+            "id": f"{batch_id}_{idx:04d}_{len(results)}",
+            "question": question,
+            "answer": answer,
+            "qa_category": "product_comparison",
+            "insurance_type": f"{profile_a.get('insurance_type', '')}/{profile_b.get('insurance_type', '')}",
+            "product_name": "",
+            "business_stage": "投保咨询",
+            "question_type": "产品对比",
+            "difficulty": "入门",
+            "comparison_type": comparison_type,
+            "product_a": product_a,
+            "product_b": product_b,
+            "comparison_dimensions": comp_intermediate.get("comparison_dimensions", []),
+            "comparison_verdict": comp_intermediate.get("overall_verdict", ""),
+            "comparison_limitations": comp_intermediate.get("comparison_limitations", ""),
+            "is_tool_routed": False,
+            "tool_routing": "",
+            "tool_params": {},
+            "requires_clarification": False,
+            "misconception": "",
+            "source_chunk_id": "",
+            "source_doc": "",
+            "source_reference": "",
+            "parent_id": "",
+            "generation_method": "product_comparison",
+            "batch_id": batch_id,
+            "created_at": created_at,
+            "tags": ["产品对比", comparison_type, product_a, product_b],
+        })
+
+    return results
+
+
+def expand_product_comparison(
+    profiles_file: str,
+    config: dict,
+    output_dir: str,
+) -> list[dict]:
+    """基于对比画像文件，生成白名单对比组合的产品对比型 Q&A"""
+    return asyncio.run(_expand_comparison_async(profiles_file, config, output_dir))
+
+
+async def _expand_comparison_async(
+    profiles_file: str,
+    config: dict,
+    output_dir: str,
+) -> list[dict]:
+    from param_extractor import COMPARISON_WHITELIST
+
+    profiles_path = Path(profiles_file)
+    if not profiles_path.exists():
+        logger.warning(f"对比画像文件不存在: {profiles_file}")
+        return []
+
+    # 加载画像，按险种分组
+    profiles_by_type: dict[str, list[dict]] = defaultdict(list)
+    with open(profiles_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                p = json.loads(line)
+                ins_type = p.get("insurance_type", "其他")
+                profiles_by_type[ins_type].append(p)
+
+    client = create_client(config, "expansion")
+    comp_template = load_prompt("generate_product_comparison")
+    render_template = load_prompt("render_product_comparison_answer")
+    concurrency = config.get("generation", {}).get("expansion", {}).get("concurrency", 5)
+    sem = asyncio.Semaphore(concurrency)
+
+    batch_id = f"comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    all_tasks = []
+
+    for idx, (type_a, type_b, comp_type) in enumerate(COMPARISON_WHITELIST):
+        profiles_a = profiles_by_type.get(type_a, [])
+        profiles_b = profiles_by_type.get(type_b, [])
+
+        if not profiles_a or not profiles_b:
+            # 使用虚拟画像（只有险种信息）
+            profile_a = {"insurance_type": type_a, "product_name": type_a}
+            profile_b = {"insurance_type": type_b, "product_name": type_b}
+            all_tasks.append(_generate_comparison_qa(
+                profile_a, profile_b, comp_type, client,
+                comp_template, render_template, sem, batch_id, idx,
+            ))
+        else:
+            # 取第一个有充足信息的画像
+            profile_a = profiles_a[0]
+            profile_b = profiles_b[0]
+            all_tasks.append(_generate_comparison_qa(
+                profile_a, profile_b, comp_type, client,
+                comp_template, render_template, sem, batch_id, idx,
+            ))
+
+    results_nested = await asyncio.gather(*all_tasks)
+    results = [qa for batch in results_nested for qa in batch]
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    out_file = output_path / f"{batch_id}.jsonl"
+    with open(out_file, "w", encoding="utf-8") as f:
+        for qa in results:
+            f.write(json.dumps(qa, ensure_ascii=False) + "\n")
+
+    logger.info(f"产品对比型 Q&A 生成完成: {len(results)} 条 → {out_file}")
+    return results
+
+
+# ============================================================
+# 工具路由问题改述扩展（P2）
+# 只改写 question，绝不改写 answer/tool_routing/tool_params
+# ============================================================
+
+_TOOL_REPHRASE_PROMPT = """请对以下保险问题生成{num_variants}种不同的问法，保持语义完全相同，
+只改变用词和句式，不要改变核心意图。
+
+原始问题：{question}
+保险类型：{insurance_type}
+
+要求：
+- 每种问法都要体现同样的查询意图
+- 可以使用同义词、改变句式结构、换角度提问
+- 每行一个，直接输出问法，不要编号或其他格式
+"""
+
+
+def expand_tool_routing_rephrase(
+    tool_routing_file: str,
+    config: dict,
+    output_dir: str,
+    num_variants: int = 3,
+) -> list[dict]:
+    """对工具路由型 Q&A 的问题进行改述扩展（只改问题，不改答案/路由）"""
+    return asyncio.run(_expand_tool_rephrase_async(tool_routing_file, config, output_dir, num_variants))
+
+
+async def _expand_tool_rephrase_async(
+    tool_routing_file: str,
+    config: dict,
+    output_dir: str,
+    num_variants: int,
+) -> list[dict]:
+    tool_path = Path(tool_routing_file)
+    if not tool_path.exists():
+        logger.warning(f"工具路由文件不存在: {tool_routing_file}")
+        return []
+
+    # 加载工具路由型 Q&A
+    tool_qa_list = []
+    with open(tool_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                qa = json.loads(line)
+                if qa.get("is_tool_routed"):
+                    tool_qa_list.append(qa)
+
+    if not tool_qa_list:
+        logger.info("未找到工具路由型 Q&A，跳过改述扩展")
+        return []
+
+    client = create_client(config, "expansion")
+    concurrency = config.get("generation", {}).get("expansion", {}).get("concurrency", 5)
+    sem = asyncio.Semaphore(concurrency)
+    batch_id = f"tool_rephrase_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    created_at = datetime.now().isoformat()
+
+    async def rephrase_one(qa: dict, idx: int) -> list[dict]:
+        async with sem:
+            prompt = _TOOL_REPHRASE_PROMPT.format(
+                question=qa["question"],
+                insurance_type=qa.get("insurance_type", ""),
+                num_variants=num_variants,
+            )
+            try:
+                response = await client.acall(prompt)
+            except Exception as e:
+                logger.warning(f"改述失败: {e}")
+                return []
+
+        variants = [line.strip() for line in response.strip().split("\n") if line.strip()][:num_variants]
+        results = []
+        for i, variant_q in enumerate(variants):
+            if len(variant_q) < 5 or variant_q == qa["question"]:
+                continue
+            new_qa = {**qa}  # 深拷贝所有字段
+            new_qa["id"] = f"{batch_id}_{idx:04d}_{i}"
+            new_qa["question"] = variant_q
+            new_qa["parent_id"] = qa.get("id", "")
+            new_qa["generation_method"] = "tool_routing_rephrase"
+            new_qa["batch_id"] = batch_id
+            new_qa["created_at"] = created_at
+            results.append(new_qa)
+        return results
+
+    tasks = [rephrase_one(qa, idx) for idx, qa in enumerate(tool_qa_list)]
+    results_nested = await asyncio.gather(*tasks)
+    results = [qa for batch in results_nested for qa in batch]
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    out_file = output_path / f"{batch_id}.jsonl"
+    with open(out_file, "w", encoding="utf-8") as f:
+        for qa in results:
+            f.write(json.dumps(qa, ensure_ascii=False) + "\n")
+
+    logger.info(f"工具路由改述扩展: {len(tool_qa_list)} 条 → {len(results)} 条 → {out_file}")
+    return results
+
+
+# ============================================================
+# 多轮澄清 + 拒答负样本（P2）
+# ============================================================
+
+# 模糊问题模板（需要反问澄清）
+_CLARIFICATION_TEMPLATES = [
+    {
+        "question": "我想买保险，怎么选？",
+        "answer": "您好！为了给您推荐最合适的保险，能告诉我您的主要保障需求吗？比如：\n"
+                  "1. 主要想解决什么风险（医疗费用/重大疾病/意外/寿险保障）？\n"
+                  "2. 预计每年的保险预算大概是多少？\n"
+                  "3. 是为自己还是家庭成员配置？\n"
+                  "根据您的具体情况，我可以给出更有针对性的建议。",
+        "requires_clarification": True,
+        "business_stage": "投保咨询",
+        "tags": ["澄清引导", "产品选择"],
+    },
+    {
+        "question": "这个保险贵吗？",
+        "answer": "保费金额取决于多个因素，需要了解更多信息才能给您准确报价：\n"
+                  "1. 您想了解哪款具体的保险产品？\n"
+                  "2. 投保人的年龄和性别？\n"
+                  "3. 希望的保额和保障期限？\n"
+                  "请告诉我以上信息，我可以为您提供精确的保费参考。",
+        "requires_clarification": True,
+        "business_stage": "投保咨询",
+        "tags": ["澄清引导", "保费查询"],
+    },
+    {
+        "question": "我能理赔吗？",
+        "answer": "是否能理赔需要根据具体情况判断，请告诉我：\n"
+                  "1. 您持有的是哪种保险（重疾险/医疗险/意外险等）？\n"
+                  "2. 发生了什么情况（疾病/手术/意外伤害等）？\n"
+                  "3. 出险时间是否在保障期内？\n"
+                  "了解这些信息后，我可以帮您初步判断是否符合理赔条件。",
+        "requires_clarification": True,
+        "business_stage": "报案",
+        "tags": ["澄清引导", "理赔咨询"],
+    },
+    {
+        "question": "保险有什么用？",
+        "answer": "这是个好问题！保险的核心作用是风险转移，但不同类型的保险用途各有侧重。\n"
+                  "您主要想了解哪个方面：\n"
+                  "A. 健康/医疗类（重疾险、医疗险）\n"
+                  "B. 寿险类（定期寿险、终身寿险）\n"
+                  "C. 意外类（意外险）\n"
+                  "D. 车险类\n"
+                  "告诉我您的关注方向，我来详细介绍！",
+        "requires_clarification": True,
+        "business_stage": "投保咨询",
+        "tags": ["澄清引导", "产品认知"],
+    },
+]
+
+# 超范围问题模板（拒答）
+_REFUSAL_TEMPLATES = [
+    {
+        "question": "帮我分析一下股票市场的走势",
+        "answer": "很抱歉，这不在我的专业范围内。我专注于保险领域的知识服务，"
+                  "包括保险产品解答、理赔指引、保障规划等。\n"
+                  "如果您有保险相关的问题，欢迎随时咨询！",
+        "qa_category": "refusal_or_clarification",
+        "tags": ["拒答", "超范围"],
+    },
+    {
+        "question": "你能帮我写一篇关于气候变化的论文吗？",
+        "answer": "非常感谢您的信任，但这超出了我的服务范围。\n"
+                  "我是保险专业助手，擅长解答保险相关问题。\n"
+                  "如果您有保险条款、理赔流程、产品对比等方面的疑问，我很乐意为您提供帮助！",
+        "qa_category": "refusal_or_clarification",
+        "tags": ["拒答", "超范围"],
+    },
+    {
+        "question": "我应该投资黄金还是基金？",
+        "answer": "投资建议超出了我的专业服务范围。我专注于保险知识服务，"
+                  "无法提供投资理财建议。\n"
+                  "但如果您对保险产品中含有投资功能的险种（如万能险、分红险）有疑问，"
+                  "我可以从保障角度为您解答。",
+        "qa_category": "refusal_or_clarification",
+        "tags": ["拒答", "超范围"],
+    },
+    {
+        "question": "你能告诉我别的客户的保单信息吗？",
+        "answer": "非常抱歉，客户的保单信息是严格保密的，任何情况下都不能向第三方披露。\n"
+                  "如果您需要查询自己的保单信息，请通过官方渠道登录验证后查询，"
+                  "或拨打客服热线进行身份核实后办理。",
+        "qa_category": "refusal_or_clarification",
+        "tags": ["拒答", "隐私保护"],
+    },
+]
+
+
+def expand_clarification_refusal(output_dir: str) -> list[dict]:
+    """生成多轮澄清 + 拒答负样本（纯模板，零 LLM）"""
+    results = []
+    batch_id = f"clarification_refusal_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    created_at = datetime.now().isoformat()
+
+    for i, item in enumerate(_CLARIFICATION_TEMPLATES):
+        qa = {
+            "id": f"{batch_id}_{i:04d}",
+            "question": item["question"],
+            "answer": item["answer"],
+            "qa_category": "refusal_or_clarification",
+            "insurance_type": "通用",
+            "product_name": "",
+            "business_stage": item.get("business_stage", "通用"),
+            "question_type": "澄清引导",
+            "difficulty": "入门",
+            "is_tool_routed": False,
+            "tool_routing": "",
+            "tool_params": {},
+            "requires_clarification": item.get("requires_clarification", True),
+            "misconception": "",
+            "source_chunk_id": "",
+            "source_doc": "",
+            "source_reference": "",
+            "parent_id": "",
+            "generation_method": "clarification_template",
+            "batch_id": batch_id,
+            "created_at": created_at,
+            "tags": item.get("tags", ["澄清引导"]),
+        }
+        results.append(qa)
+
+    for i, item in enumerate(_REFUSAL_TEMPLATES):
+        qa = {
+            "id": f"{batch_id}_r{i:04d}",
+            "question": item["question"],
+            "answer": item["answer"],
+            "qa_category": "refusal_or_clarification",
+            "insurance_type": "通用",
+            "product_name": "",
+            "business_stage": "通用",
+            "question_type": "澄清引导",
+            "difficulty": "入门",
+            "is_tool_routed": False,
+            "tool_routing": "",
+            "tool_params": {},
+            "requires_clarification": False,
+            "misconception": "",
+            "source_chunk_id": "",
+            "source_doc": "",
+            "source_reference": "",
+            "parent_id": "",
+            "generation_method": "refusal_template",
+            "batch_id": batch_id,
+            "created_at": created_at,
+            "tags": item.get("tags", ["拒答"]),
+        }
+        results.append(qa)
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    out_file = output_path / f"{batch_id}.jsonl"
+    with open(out_file, "w", encoding="utf-8") as f:
+        for qa in results:
+            f.write(json.dumps(qa, ensure_ascii=False) + "\n")
+
+    logger.info(f"澄清/拒答 Q&A 生成: {len(results)} 条 → {out_file}")
     return results
 
 

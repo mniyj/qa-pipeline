@@ -13,6 +13,8 @@ from orchestrator import (
     cmd_seed_dedup,
     cmd_expand,
     cmd_tool_routing,
+    cmd_comparison,
+    cmd_p2_quality,
     cmd_qc,
 )
 
@@ -163,6 +165,22 @@ def run_step(step: str):
                         s, status="done", progress=100,
                         output_count=report.get("total", 0),
                         message=f"工具路由 {report.get('tool_routing_count', 0)} 条 + 保全变更 {report.get('policy_service_count', 0)} 条",
+                    )
+
+                elif s == "comparison":
+                    report = cmd_comparison(config, progress_callback=_make_progress_cb(s)) or {}
+                    pipeline_state.update_step(
+                        s, status="done", progress=100,
+                        output_count=report.get("total", 0),
+                        message=f"对比 {report.get('comparison_count', 0)} + 误解纠正 {report.get('misconception_count', 0)} + 澄清 {report.get('clarification_count', 0)}",
+                    )
+
+                elif s == "p2_quality":
+                    report = cmd_p2_quality(config, progress_callback=_make_progress_cb(s)) or {}
+                    pipeline_state.update_step(
+                        s, status="done", progress=100,
+                        output_count=report.get("tool_routing_rephrase", 0),
+                        message=f"改述 {report.get('tool_routing_rephrase', 0)} + 回溯存疑 {report.get('anchor_verify_flagged', 0)}",
                     )
 
                 elif s == "qc":

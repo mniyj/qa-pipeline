@@ -1,0 +1,50 @@
+你是资深保险产品对比分析专家。请基于两款产品的结构化对比画像，生成一份结构化的产品对比中间态。
+
+## 产品 A 画像
+{profile_a}
+
+## 产品 B 画像
+{profile_b}
+
+## 对比类型
+{comparison_type}
+
+## 对比要求
+
+【允许的对比维度】只能从以下9个维度进行对比，禁止自由发散：
+1. 产品定位
+2. 保障对象
+3. 赔付方式与触发条件
+4. 保障范围
+5. 责任免除/关键限制
+6. 续保/保障期限
+7. 适用人群
+8. 是否可替代
+9. 是否建议组合配置
+
+【敏感维度处理】若对比涉及价格/保费/退保金/核保条件，不要直接比较，
+在 comparison_limitations 中说明需通过工具获取，并将该维度加入 sensitive_dimensions。
+
+【证据优先原则】对比结论必须有来源画像字段的支撑，不得凭行业经验推断。
+画像字段为"未知"时，对应维度的对比结论写"需查阅具体条款"。
+
+只输出 JSON，不要其他说明：
+{{
+  "product_a": "{product_a_name}",
+  "product_b": "{product_b_name}",
+  "comparison_type": "{comparison_type}",
+  "comparison_dimensions": [
+    {{
+      "dimension": "维度名称",
+      "a": "产品A的情况",
+      "b": "产品B的情况",
+      "verdict": "对比小结（可选）"
+    }}
+  ],
+  "overall_verdict": "整体对比结论（2-3句）",
+  "replaceability": "是否可互相替代及原因",
+  "combo_recommendation": "是否建议组合及原因",
+  "sensitive_dimensions": ["保费", "退保金额"],
+  "comparison_limitations": "对比局限说明（敏感维度需工具、信息不足等）",
+  "confidence": "high|medium|low（基于画像数据完整度）"
+}}
