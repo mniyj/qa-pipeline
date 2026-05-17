@@ -8,6 +8,7 @@ quality_checker.py
 """
 
 import json
+import os
 import re
 import argparse
 import logging
@@ -207,7 +208,7 @@ def run_format_check(qa_list: list[dict]) -> tuple[list[dict], list[dict]]:
             qa["_qc_issues"] = all_issues
             return "fail", qa
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(os.cpu_count() or 4, 16)) as executor:
         futures = [executor.submit(check_one, qa) for qa in qa_list]
         for future in concurrent.futures.as_completed(futures):
             status, qa = future.result()
@@ -514,7 +515,7 @@ def run_fact_check(qa_list: list[dict]) -> tuple[list[dict], list[dict]]:
             return "flag", qa
         return "pass", qa
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(os.cpu_count() or 4, 16)) as executor:
         futures = [executor.submit(check_one, qa) for qa in qa_list]
         for future in concurrent.futures.as_completed(futures):
             status, qa = future.result()
@@ -713,17 +714,121 @@ def run_coverage_analysis(qa_list: list[dict], config: dict) -> dict:
 # Stage 5: 分层答案回溯校验（P2）
 # ============================================================
 
-def _build_chunks_index(qa_list: list[dict], chunks_dir: str) -> dict[str, str]:
-    """从 chunks.jsonl 构建 chunk_id → text 索引"""
+_CHUNKS_INDEX_CACHE: dict[str, tuple[float, dict[str, str]]] = {}  # path → (mtime, index)
+_CHUNKS_META_CACHE: dict[str, tuple[float, tuple[dict[str, dict], dict[str, dict]]]] = {}  # path → (mtime, (by_chunk, by_doc))
+
+
+def _build_chunks_meta_indexes(chunks_dir: str) -> tuple[dict[str, dict], dict[str, dict]]:
+    """构建 chunk_id/doc_file 元数据索引，用于 P2 分池前运行时补齐来源类型。"""
     chunks_file = Path(chunks_dir) / "chunks.jsonl"
-    index: dict[str, str] = {}
     if not chunks_file.exists():
-        return index
+        return {}, {}
+    mtime = chunks_file.stat().st_mtime
+    cache_key = str(chunks_file)
+    if cache_key in _CHUNKS_META_CACHE and _CHUNKS_META_CACHE[cache_key][0] == mtime:
+        return _CHUNKS_META_CACHE[cache_key][1]
+
+    by_chunk: dict[str, dict] = {}
+    by_doc: dict[str, dict] = {}
+    with open(chunks_file, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            chunk = json.loads(line)
+            chunk_id = chunk.get("chunk_id", "")
+            doc_file = chunk.get("doc_file", "")
+            meta = {
+                "chunk_id": chunk_id,
+                "doc_file": doc_file,
+                "doc_type": chunk.get("doc_type", "未分类"),
+                "insurance_type": chunk.get("insurance_type", "其他保险"),
+                "product_name": chunk.get("product_name", "") or "",
+                "text": chunk.get("text", ""),
+            }
+            if chunk_id:
+                by_chunk[chunk_id] = meta
+            if doc_file and doc_file not in by_doc:
+                by_doc[doc_file] = {
+                    "doc_file": doc_file,
+                    "doc_type": meta["doc_type"],
+                    "insurance_type": meta["insurance_type"],
+                    "product_name": meta["product_name"],
+                }
+
+    _CHUNKS_META_CACHE[cache_key] = (mtime, (by_chunk, by_doc))
+    return by_chunk, by_doc
+
+
+def enrich_p2_source_metadata(qa_list: list[dict], chunks_dir: str, config: dict) -> list[dict]:
+    """
+    运行时补齐 P2 所需的来源元数据，不回写 qa_passed.jsonl。
+    优先按 source_chunk_id 回查，缺失时按 source_doc 回查。
+    """
+    by_chunk, by_doc = _build_chunks_meta_indexes(chunks_dir)
+    qcfg = config.get("quality_check", {})
+    product_doc_types = set(qcfg.get("p2_product_doc_types", ["保险条款", "理赔指南", "核保手册", "产品说明书"]))
+    regulatory_doc_types = set(qcfg.get("p2_regulatory_doc_types", ["法律法规", "监管文件", "行业标准"]))
+
+    enriched = []
+    for qa in qa_list:
+        qa = dict(qa)
+        meta = {}
+        chunk_id = qa.get("source_chunk_id", "")
+        source_doc = qa.get("source_doc", "")
+        if chunk_id and chunk_id in by_chunk:
+            meta = by_chunk[chunk_id]
+        elif source_doc and source_doc in by_doc:
+            meta = by_doc[source_doc]
+
+        doc_type = meta.get("doc_type") or qa.get("doc_type") or qa.get("source_doc_type") or "未分类"
+        qa["source_doc_type"] = doc_type
+        if not qa.get("doc_type"):
+            qa["doc_type"] = doc_type
+        if meta.get("doc_file") and not qa.get("source_doc"):
+            qa["source_doc"] = meta["doc_file"]
+        if meta.get("product_name") and not qa.get("product_name"):
+            qa["product_name"] = meta["product_name"]
+        if meta.get("insurance_type") and not qa.get("insurance_type"):
+            qa["insurance_type"] = meta["insurance_type"]
+
+        if doc_type in product_doc_types:
+            qa["p2_pool"] = "product_docs"
+        elif doc_type in regulatory_doc_types:
+            qa["p2_pool"] = "regulatory_docs"
+        else:
+            qa["p2_pool"] = "unknown_docs"
+        enriched.append(qa)
+    return enriched
+
+
+def split_p2_pools(qa_list: list[dict], config: dict) -> dict[str, list[dict]]:
+    pools = {"product_docs": [], "regulatory_docs": [], "unknown_docs": []}
+    unknown_policy = config.get("quality_check", {}).get("p2_unknown_policy", "regulatory")
+    for qa in qa_list:
+        pool = qa.get("p2_pool", "unknown_docs")
+        pools.setdefault(pool, []).append(qa)
+        if pool == "unknown_docs" and unknown_policy == "regulatory":
+            qa["effective_p2_pool"] = "regulatory_docs"
+        else:
+            qa["effective_p2_pool"] = pool
+    return pools
+
+def _build_chunks_index(qa_list: list[dict], chunks_dir: str) -> dict[str, str]:
+    """从 chunks.jsonl 构建 chunk_id → text 索引（按 mtime 缓存，避免重复加载）"""
+    chunks_file = Path(chunks_dir) / "chunks.jsonl"
+    if not chunks_file.exists():
+        return {}
+    mtime = chunks_file.stat().st_mtime
+    cache_key = str(chunks_file)
+    if cache_key in _CHUNKS_INDEX_CACHE and _CHUNKS_INDEX_CACHE[cache_key][0] == mtime:
+        return _CHUNKS_INDEX_CACHE[cache_key][1]
+    index: dict[str, str] = {}
     with open(chunks_file, "r", encoding="utf-8") as f:
         for line in f:
             if line.strip():
                 chunk = json.loads(line)
                 index[chunk.get("chunk_id", "")] = chunk.get("text", "")
+    _CHUNKS_INDEX_CACHE[cache_key] = (mtime, index)
     return index
 
 
@@ -747,6 +852,36 @@ def anchor_verify(qa: dict, chunks_index: dict[str, str]) -> list[str]:
     return issues
 
 
+def regulatory_anchor_verify(qa: dict, chunks_index: dict[str, str]) -> list[str]:
+    """
+    规范性文档校验：只核查法条编号、明确期限/金额与来源 chunk 的显式一致性。
+    不对抽象归纳或解释性总结做产品型数字锚定误报。
+    """
+    if qa.get("is_tool_routed"):
+        return []
+    issues = []
+    chunk_id = qa.get("source_chunk_id", "")
+    if not chunk_id or chunk_id not in chunks_index:
+        return []
+
+    answer = qa.get("answer", "")
+    source_text = chunks_index[chunk_id]
+
+    article_refs = set(re.findall(r"第[一二三四五六七八九十百千万\d]+条", answer))
+    for ref in article_refs:
+        if ref not in source_text:
+            issues.append(f"法条引用 '{ref}' 未在来源 chunk 中找到")
+
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*(万)?\s*(元|天|日|年|%|个月)", answer):
+        value = m.group(0).replace(" ", "")
+        window_start = max(0, m.start() - 10)
+        window = answer[window_start:m.end() + 10]
+        if any(token in window for token in ("第", "法", "条例", "规定", "办法", "期限", "时限", "限额")):
+            if value not in source_text and m.group(0) not in source_text:
+                issues.append(f"规范性文档关键值 '{value}' 未在来源 chunk 中找到")
+    return issues
+
+
 def _is_high_risk_qa(qa: dict, anchor_issues: list[str]) -> bool:
     """判断是否为高风险条目，需要进行 LLM 二级校验"""
     if anchor_issues:
@@ -760,6 +895,16 @@ def _is_high_risk_qa(qa: dict, anchor_issues: list[str]) -> bool:
         chain_depth = qa.get("chain_depth", 0)
         if chain_depth >= 3:
             return True
+    return False
+
+
+def _is_high_risk_regulatory_qa(qa: dict, anchor_issues: list[str]) -> bool:
+    """规范性文档仅在条文号、金额/期限冲突或引用缺失时进入二级校验。"""
+    if anchor_issues:
+        return True
+    answer = qa.get("answer", "")
+    if re.search(r"第[一二三四五六七八九十百千万\d]+条", answer) and not qa.get("source_chunk_id"):
+        return True
     return False
 
 
@@ -789,11 +934,12 @@ def run_anchor_verify(
     chunks_dir: str,
     config: dict,
     llm_verify_rate: float = 0.05,
+    checkpoint_file: str | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     分层答案回溯校验：
     Level 1（零成本）: 锚点数字校验
-    Level 2（~5% LLM）: 高风险条目 LLM 核验
+    Level 2（并发 LLM，~5%）: 高风险条目 LLM 核验，支持断点续传
     返回 (通过列表, 存疑列表)
     """
     chunks_index = _build_chunks_index(qa_list, chunks_dir)
@@ -816,23 +962,40 @@ def run_anchor_verify(
 
     logger.info(f"LLM 二级校验: {len(llm_verify_targets)}/{len(qa_list)} 条（高风险抽样）")
 
-    # LLM 二级校验（异步）
+    # 加载断点：已完成的校验结果
     llm_results: dict[str, dict] = {}
-    if llm_verify_targets:
+    ckpt_path = Path(checkpoint_file) if checkpoint_file else None
+    if ckpt_path and ckpt_path.exists():
+        with open(ckpt_path, "r", encoding="utf-8") as f:
+            llm_results = json.load(f)
+        logger.info(f"断点续传: 已加载 {len(llm_results)} 条 Level-2 校验结果")
+
+    pending = [qa for qa in llm_verify_targets if qa.get("id", "") not in llm_results]
+
+    # LLM 二级校验（异步并发）
+    if pending:
         try:
             import asyncio as _asyncio
             from llm_client import create_client as _create_client
             verify_template = (Path(__file__).parent.parent / "prompts" / "verify_answer.txt").read_text(encoding="utf-8")
             client = _create_client(config, "quality_check")
-            sem = _asyncio.Semaphore(3)
+            concurrency = config.get("quality_check", {}).get("verify_concurrency", 10)
+            sem = _asyncio.Semaphore(concurrency)
 
             async def _run_llm_verify():
-                tasks = [_llm_verify_one(qa, chunks_index, client, verify_template, sem) for qa in llm_verify_targets]
+                async def _verify_and_save(qa: dict) -> dict:
+                    r = await _llm_verify_one(qa, chunks_index, client, verify_template, sem)
+                    llm_results[r["qa_id"]] = r
+                    if ckpt_path:
+                        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(ckpt_path, "w", encoding="utf-8") as f:
+                            json.dump(llm_results, f, ensure_ascii=False)
+                    return r
+
+                tasks = [_verify_and_save(qa) for qa in pending]
                 return await _asyncio.gather(*tasks)
 
-            results = asyncio.run(_run_llm_verify())
-            for r in results:
-                llm_results[r["qa_id"]] = r
+            asyncio.run(_run_llm_verify())
         except Exception as e:
             logger.warning(f"LLM 二级校验失败: {e}")
 
@@ -853,73 +1016,190 @@ def run_anchor_verify(
     return passed, flagged
 
 
+def run_regulatory_anchor_verify(
+    qa_list: list[dict],
+    chunks_dir: str,
+    config: dict,
+    llm_verify_rate: float = 0.01,
+    checkpoint_file: str | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """
+    规范性文档的简化 P2：
+    Level 1: 法条号/明确期限金额校验
+    Level 2: 仅对冲突或引用缺失的条目做小样本 LLM 校验
+    """
+    chunks_index = _build_chunks_index(qa_list, chunks_dir)
+    if not chunks_index:
+        logger.info("未找到 chunks 索引，跳过规范性文档回溯校验")
+        return qa_list, []
+
+    level1_issues: dict[str, list[str]] = {}
+    for qa in qa_list:
+        issues = regulatory_anchor_verify(qa, chunks_index)
+        if issues:
+            level1_issues[qa.get("id", "")] = issues
+
+    logger.info(f"规范性文档锚点校验: {len(level1_issues)} 条发现条文/期限/金额不一致")
+
+    high_risk = [qa for qa in qa_list if _is_high_risk_regulatory_qa(qa, level1_issues.get(qa.get('id', ''), []))]
+    sample_size = min(len(high_risk), max(1, int(len(qa_list) * llm_verify_rate))) if qa_list else 0
+    llm_verify_targets = high_risk[:sample_size]
+    logger.info(f"规范性文档 LLM 二级校验: {len(llm_verify_targets)}/{len(qa_list)} 条")
+
+    llm_results: dict[str, dict] = {}
+    ckpt_path = Path(checkpoint_file) if checkpoint_file else None
+    if ckpt_path and ckpt_path.exists():
+        with open(ckpt_path, "r", encoding="utf-8") as f:
+            llm_results = json.load(f)
+        logger.info(f"断点续传: 已加载 {len(llm_results)} 条规范性文档 Level-2 校验结果")
+
+    pending = [qa for qa in llm_verify_targets if qa.get("id", "") not in llm_results]
+    if pending:
+        try:
+            import asyncio as _asyncio
+            from llm_client import create_client as _create_client
+            verify_template = (Path(__file__).parent.parent / "prompts" / "verify_answer_regulatory.txt").read_text(encoding="utf-8")
+            client = _create_client(config, "quality_check")
+            concurrency = config.get("quality_check", {}).get("verify_concurrency", 10)
+            sem = _asyncio.Semaphore(concurrency)
+
+            async def _run_llm_verify():
+                async def _verify_and_save(qa: dict) -> dict:
+                    r = await _llm_verify_one(qa, chunks_index, client, verify_template, sem)
+                    llm_results[r["qa_id"]] = r
+                    if ckpt_path:
+                        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(ckpt_path, "w", encoding="utf-8") as f:
+                            json.dump(llm_results, f, ensure_ascii=False)
+                    return r
+
+                tasks = [_verify_and_save(qa) for qa in pending]
+                return await _asyncio.gather(*tasks)
+
+            asyncio.run(_run_llm_verify())
+        except Exception as e:
+            logger.warning(f"规范性文档 LLM 二级校验失败: {e}")
+
+    passed, flagged = [], []
+    for qa in qa_list:
+        qa_id = qa.get("id", "")
+        l1_issues = level1_issues.get(qa_id, [])
+        llm_result = llm_results.get(qa_id, {})
+        llm_issues = llm_result.get("issues", []) if llm_result.get("verdict") == "flag" else []
+        all_issues = l1_issues + llm_issues
+        if all_issues:
+            qa["_verify_issues"] = all_issues
+            flagged.append(qa)
+        else:
+            passed.append(qa)
+
+    logger.info(f"规范性文档回溯校验: {len(passed)} 通过, {len(flagged)} 存疑")
+    return passed, flagged
+
+
 # ============================================================
 # Stage 6: LLM 自动评分（P2，抽样层）
 # ============================================================
-
-LLM_SCORING_PROMPT = """你是保险知识库质检专家，请对以下问答对进行质量评分。
-
-## 问答对
-问题：{question}
-答案：{answer}
-险种：{insurance_type}
-问题类型：{question_type}
-
-## 评分维度（各1-5分）
-1. 准确性：答案是否正确，无明显错误
-2. 完整性：答案是否完整覆盖问题要点
-3. 实用性：答案对用户的实际帮助程度
-4. 专业性：术语使用是否准确恰当
-5. 清晰度：答案是否易于理解
-
-只输出 JSON，不要其他说明：
-{{"accuracy": 4, "completeness": 3, "practicality": 5, "professionalism": 4, "clarity": 4, "overall": 4.0, "comment": "一句话点评"}}
-"""
+SCORING_PROFILES = {
+    "product": {
+        "prompt_file": "score_product_qa.txt",
+        "dimensions": ["accuracy", "completeness", "practicality", "professionalism", "clarity", "overall"],
+    },
+    "regulatory": {
+        "prompt_file": "score_regulatory_qa.txt",
+        "dimensions": ["rule_accuracy", "citation_appropriateness", "overreach_risk", "clarity", "kb_fitness", "overall"],
+    },
+}
 
 
 def run_llm_scoring(
     qa_list: list[dict],
     config: dict,
     sample_rate: float = 0.05,
+    checkpoint_file: str | None = None,
+    scoring_profile: str = "product",
 ) -> dict:
-    """对质检通过的 Q&A 抽样进行 LLM 五维评分"""
+    """对质检通过的 Q&A 抽样进行 LLM 五维评分（异步并发 + 断点续传）"""
     import random
+
+    profile = SCORING_PROFILES.get(scoring_profile, SCORING_PROFILES["product"])
+    prompt_template = (Path(__file__).parent.parent / "prompts" / profile["prompt_file"]).read_text(encoding="utf-8")
+
+    # 跨池一致性校验：product 池中有 product_name 为空的条目，或 regulatory 池中有 product_name 的条目，记录警告
+    if scoring_profile == "product":
+        no_product = [qa for qa in qa_list if not qa.get("product_name")]
+        if no_product:
+            logger.warning(
+                f"跨池警告: product 评分池中有 {len(no_product)} 条 product_name 为空的条目，"
+                "可能来自监管类文档，建议检查 enrich_p2_source_metadata 分池逻辑"
+            )
+    elif scoring_profile == "regulatory":
+        has_product = [qa for qa in qa_list if qa.get("product_name")]
+        if has_product:
+            logger.warning(
+                f"跨池警告: regulatory 评分池中有 {len(has_product)} 条携带 product_name 的条目，"
+                f"示例: {has_product[0].get('product_name', '')} ({has_product[0].get('source_doc', '')})"
+            )
+
     sample_size = max(1, int(len(qa_list) * sample_rate))
     sample = random.sample(qa_list, min(sample_size, len(qa_list)))
-
     logger.info(f"LLM 自动评分: 从 {len(qa_list)} 条中抽取 {len(sample)} 条评分")
 
-    from llm_client import create_client
-    client = create_client(config, "quality_check")
+    # 加载断点
+    ckpt_path = Path(checkpoint_file) if checkpoint_file else None
+    scores_by_id: dict[str, dict] = {}
+    if ckpt_path and ckpt_path.exists():
+        with open(ckpt_path, "r", encoding="utf-8") as f:
+            scores_by_id = json.load(f)
+        logger.info(f"断点续传: 已加载 {len(scores_by_id)} 条评分结果")
 
-    scores = []
-    for qa in sample:
-        try:
-            prompt = LLM_SCORING_PROMPT.format(
-                question=qa.get("question", ""),
-                answer=qa.get("answer", ""),
-                insurance_type=qa.get("insurance_type", ""),
-                question_type=qa.get("question_type", ""),
-            )
-            response = client.call(prompt)
-            response = re.sub(r"```(?:json)?\s*", "", response).strip()
-            result = json.loads(response)
-            result["qa_id"] = qa.get("id", "")
-            scores.append(result)
-        except Exception as e:
-            logger.warning(f"评分失败 ({qa.get('id', '')}): {e}")
-            continue
+    pending = [qa for qa in sample if qa.get("id", "") not in scores_by_id]
 
+    if pending:
+        from llm_client import create_client
+        client = create_client(config, "quality_check")
+        concurrency = config.get("quality_check", {}).get("scoring_concurrency", 10)
+
+        async def _score_all():
+            sem = asyncio.Semaphore(concurrency)
+
+            async def _score_one(qa: dict):
+                async with sem:
+                    try:
+                        prompt = prompt_template.format(
+                            question=qa.get("question", ""),
+                            answer=qa.get("answer", ""),
+                            insurance_type=qa.get("insurance_type", ""),
+                            question_type=qa.get("question_type", ""),
+                        )
+                        response = await client.acall(prompt)
+                        response = re.sub(r"```(?:json)?\s*", "", response).strip()
+                        result = json.loads(response)
+                        result["qa_id"] = qa.get("id", "")
+                        scores_by_id[result["qa_id"]] = result
+                        if ckpt_path:
+                            ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+                            with open(ckpt_path, "w", encoding="utf-8") as f:
+                                json.dump(scores_by_id, f, ensure_ascii=False)
+                    except Exception as e:
+                        logger.warning(f"评分失败 ({qa.get('id', '')}): {e}")
+
+            await asyncio.gather(*[_score_one(qa) for qa in pending])
+
+        asyncio.run(_score_all())
+
+    scores = list(scores_by_id.values())
     if not scores:
         return {"sample_size": 0, "avg_scores": {}}
 
-    dims = ["accuracy", "completeness", "practicality", "professionalism", "clarity", "overall"]
+    dims = profile["dimensions"]
     avg_scores = {}
     for dim in dims:
         vals = [s[dim] for s in scores if isinstance(s.get(dim), (int, float))]
         avg_scores[dim] = round(sum(vals) / len(vals), 2) if vals else 0.0
 
     report = {
+        "scoring_profile": scoring_profile,
         "sample_size": len(scores),
         "total_qa": len(qa_list),
         "sample_rate": f"{len(scores)/len(qa_list):.1%}",
