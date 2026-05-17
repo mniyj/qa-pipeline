@@ -19,3 +19,4 @@ data/qc_results/*
 !data/qc_results/qa_passed.csv
 data/final/*
 !data/final/.gitkeep
+.worktrees/
