@@ -110,6 +110,7 @@ preprocessing:
   chunk_size: 1200          # 每个 chunk 的目标字数
   chunk_overlap: 200        # chunk 之间的重叠字数
   min_chunk_size: 300       # 低于此长度的 chunk 会合并到上一个
+  doc_concurrency: 8        # 文档并行预处理线程数
   supported_formats:
     - .pdf
     - .docx
@@ -178,14 +179,14 @@ generation:
   seed:
     pairs_per_chunk: 8              # 每个 chunk 生成几条种子 Q&A
     batch_size: 10                  # 每批处理多少个 chunk
-    concurrency: 20                 # 并发调用数
+    concurrency: 50                 # 并发调用数
 
   expansion:
     rephrase_variants: 5            # 每条种子的改述变体数
     scenario_transfer_targets: 4    # 场景迁移的目标场景数
     follow_up_depth: 4              # 追问链深度
     template_batch_size: 50         # 模板批量生成的每批数量
-    concurrency: 5
+    concurrency: 50
 
 # ---------- 质检配置 ----------
 quality_check:
@@ -195,6 +196,22 @@ quality_check:
   consistency_check: true
   coverage_analysis: true
   human_sample_rate: 0.05           # 5% 人工抽检
+  p2_product_doc_types:
+    - 保险条款
+    - 理赔指南
+    - 核保手册
+    - 产品说明书
+  p2_regulatory_doc_types:
+    - 法律法规
+    - 监管文件
+    - 行业标准
+  p2_unknown_policy: regulatory
+  product_verify_rate: 0.05
+  regulatory_verify_rate: 0.01
+  product_scoring_rate: 0.05
+  regulatory_scoring_rate: 0.03
+  verify_concurrency: 30            # 锚点 Level-2 LLM 校验并发数
+  scoring_concurrency: 30           # LLM 评分并发数
   min_answer_length: 30
   max_answer_length: 2000
   min_question_length: 10

@@ -18,7 +18,7 @@
     "question": "追问问题",
     "answer": "回答",
     "difficulty": "入门|进阶|专业",
-    "question_type": "根据内容判断",
+    "question_type": "概念解释|流程指引|条款解读|边界判断|计算说明|对比区分|产品对比|注意事项|赔付判断|操作指引|争议处理|案例分析",
     "insurance_type": "{insurance_type}",
     "follow_up_type": "深入细节|边界探索|实操追问|费用时间|补救方案",
     "turn": 1,

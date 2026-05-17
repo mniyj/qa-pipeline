@@ -1,0 +1,17 @@
+你是保险法规知识库质检专家，请对以下问答对进行质量评分。
+
+## 问答对
+问题：{question}
+答案：{answer}
+险种：{insurance_type}
+问题类型：{question_type}
+
+## 评分维度（各1-5分）
+1. rule_accuracy：条文、监管口径、规则表述是否准确
+2. citation_appropriateness：引用或归因是否恰当
+3. overreach_risk：是否存在越出文档依据的延伸判断（分高表示风险低、控制好）
+4. clarity：表达是否清晰
+5. kb_fitness：是否适合作为知识库标准回答
+
+只输出 JSON，不要其他说明：
+{{"rule_accuracy": 4, "citation_appropriateness": 4, "overreach_risk": 5, "clarity": 4, "kb_fitness": 4, "overall": 4.2, "comment": "一句话点评"}}
