@@ -36,7 +36,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 
 from doc_preprocessor import process_all_documents
 from seed_generator import generate_seeds_from_chunks
-from expander import expand_rephrase, expand_followup, expand_template, load_seeds
+from expander import expand_rephrase, expand_followup, expand_template, load_seeds, expand_tool_routing, expand_policy_service
 from quality_checker import run_full_qc
 from llm_client import usage_stats
 
@@ -268,6 +268,39 @@ def cmd_expand(config: dict, seed_file: str = None, limit: int = None, progress_
 
 
 # ============================================================
+# Step 3c: 工具路由型 Q&A 生成（纯模板，零 LLM token）
+# ============================================================
+def cmd_tool_routing(config: dict, progress_callback=None) -> dict:
+    """生成工具路由型 Q&A（核保/保费/现金价值/理赔/账户查询）"""
+    paths = config["storage"]["paths"]
+    expanded_dir = paths["expanded"]
+
+    if progress_callback:
+        progress_callback(10, 100)
+
+    results = expand_tool_routing(expanded_dir)
+
+    if progress_callback:
+        progress_callback(70, 100)
+
+    # 同时生成保全变更场景
+    schema = config.get("knowledge_schema", {})
+    ins_types = schema.get("insurance_types", [])
+    long_term_types = [
+        t for t in ins_types
+        if any(k in t for k in ["寿险", "重疾", "年金", "两全", "医疗", "意外"])
+    ]
+    policy_results = expand_policy_service(long_term_types or ins_types[:20], expanded_dir)
+
+    if progress_callback:
+        progress_callback(100, 100)
+
+    total = len(results) + len(policy_results)
+    logger.info(f"工具路由步骤完成: 工具路由 {len(results)} 条 + 保全变更 {len(policy_results)} 条 = {total} 条")
+    return {"tool_routing_count": len(results), "policy_service_count": len(policy_results), "total": total}
+
+
+# ============================================================
 # Step 4: 质检
 # ============================================================
 def cmd_qc(config: dict, input_files: list[str] = None, progress_callback=None):
@@ -405,6 +438,10 @@ def cmd_run(config: dict, seed_limit: int = None, expand_limit: int = None):
         chunks_dir=config["storage"]["paths"]["chunks"],
     )
 
+    # Step 3c: 工具路由型 Q&A 生成（纯模板，零 LLM）
+    logger.info("=" * 40 + " Step 3c: 工具路由型 Q&A 生成 " + "=" * 40)
+    cmd_tool_routing(config)
+
     # Step 4
     logger.info("=" * 40 + " Step 4: 质量检查 " + "=" * 40)
     cmd_qc(config)
@@ -434,7 +471,7 @@ def main():
   python src/orchestrator.py run --seed-limit 3   # 全流程试跑
         """
     )
-    parser.add_argument("command", choices=["run", "preprocess", "seed", "seed-dedup", "expand", "expand-template", "qc", "status"])
+    parser.add_argument("command", choices=["run", "preprocess", "seed", "seed-dedup", "expand", "expand-template", "tool-routing", "qc", "status"])
     parser.add_argument("--config", default="./config/config.yaml")
     parser.add_argument("--limit", type=int, default=None, help="限制处理数量")
     parser.add_argument("--seed-limit", type=int, default=None, help="种子阶段限制chunk数")
@@ -462,6 +499,8 @@ def main():
             config["storage"]["paths"]["expanded"],
             chunks_dir=config["storage"]["paths"]["chunks"],
         )
+    elif args.command == "tool-routing":
+        cmd_tool_routing(config)
     elif args.command == "qc":
         cmd_qc(config, input_files=args.input)
     elif args.command == "run":

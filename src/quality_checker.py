@@ -25,15 +25,124 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 
 # ============================================================
-# Stage 1: 格式校验
+# 元数据枚举约束
 # ============================================================
 VALID_DIFFICULTIES = {"入门", "进阶", "专业"}
 VALID_QUESTION_TYPES = {
     "概念解释", "流程指引", "条款解读", "边界判断",
     "计算说明", "对比区分", "注意事项", "案例分析",
-    "法规引用", "争议处理", "赔付判断", "产品对比",
-    "核保影响", "操作指引",
+    "赔付判断", "操作指引",
+    "保全操作", "健康告知", "争议处理",
+    "产品对比", "澄清引导",
 }
+VALID_BUSINESS_STAGES = {
+    "投保咨询", "健康告知", "核保", "承保生效",
+    "保全变更", "续保复效", "报案", "理赔材料",
+    "理赔审核", "赔付结案", "拒赔争议", "通用",
+}
+STAGE_NORMALIZE = {
+    "产品设计": "投保咨询", "精算定价": "投保咨询",
+    "销售展业": "投保咨询", "投保告知": "健康告知",
+    "承保出单": "承保生效", "续保续费": "续保复效",
+    "查勘定损": "理赔审核",
+    "理赔": "理赔审核", "投保": "投保咨询",
+    "销售": "投保咨询", "承保": "承保生效",
+    "保全": "保全变更", "续保": "续保复效",
+    "拒赔": "拒赔争议",
+}
+VALID_QA_CATEGORIES = {
+    "knowledge", "tool_routed", "misconception_correction",
+    "product_comparison", "refusal_or_clarification",
+}
+
+
+def normalize_metadata(qa: dict) -> dict:
+    """入库前统一归一化元数据字段"""
+    # business_stage
+    stage = qa.get("business_stage", "通用")
+    qa["business_stage"] = STAGE_NORMALIZE.get(stage, stage)
+    if qa["business_stage"] not in VALID_BUSINESS_STAGES:
+        qa["business_stage"] = "通用"
+
+    # difficulty
+    diff = qa.get("difficulty", "入门")
+    qa["difficulty"] = {"入门级": "入门", "进阶级": "进阶", "专业级": "专业"}.get(diff, diff)
+    if qa["difficulty"] not in VALID_DIFFICULTIES:
+        qa["difficulty"] = "入门"
+
+    # question_type
+    if qa.get("question_type") not in VALID_QUESTION_TYPES:
+        qa["question_type"] = "概念解释"
+
+    # qa_category 推断
+    if not qa.get("qa_category"):
+        if qa.get("is_tool_routed"):
+            qa["qa_category"] = "tool_routed"
+        elif qa.get("misconception"):
+            qa["qa_category"] = "misconception_correction"
+        elif qa.get("comparison_type"):
+            qa["qa_category"] = "product_comparison"
+        elif qa.get("requires_clarification"):
+            qa["qa_category"] = "refusal_or_clarification"
+        else:
+            qa["qa_category"] = "knowledge"
+
+    if qa.get("qa_category") not in VALID_QA_CATEGORIES:
+        qa["qa_category"] = "knowledge"
+
+    # tool_routing 一致性
+    if qa.get("tool_routing") and not qa.get("is_tool_routed"):
+        qa["is_tool_routed"] = True
+    if qa.get("is_tool_routed") and not qa.get("tool_routing"):
+        qa["is_tool_routed"] = False
+
+    # 默认值补全
+    defaults = [
+        ("product_name", ""), ("tool_routing", ""), ("tool_params", {}),
+        ("is_tool_routed", False), ("requires_clarification", False),
+        ("misconception", ""), ("qa_category", "knowledge"),
+        ("comparison_type", ""), ("product_a", ""), ("product_b", ""),
+        ("comparison_dimensions", []), ("comparison_verdict", ""),
+        ("comparison_limitations", ""),
+    ]
+    for field, default in defaults:
+        qa.setdefault(field, default)
+
+    return qa
+
+
+# ============================================================
+# 工具路由安全校验
+# ============================================================
+def validate_tool_routing_safety(qa: dict) -> list[str]:
+    """检查工具路由型答案是否包含不应出现的确定性结论"""
+    if not qa.get("is_tool_routed"):
+        return []
+    issues = []
+    answer = qa.get("answer", "")
+    dangerous_patterns = [
+        r"可以(?:投保|购买|买)",
+        r"不能(?:投保|购买|买)",
+        r"会被拒保",
+        r"标准体承保",
+        r"加费承保",
+        r"除外承保",
+        r"保费(?:为|是)\s*\d+",
+        r"(?:退保金|现金价值)(?:为|是)\s*\d+",
+        r"(?:能|可以)赔\s*\d+",
+        r"一定(?:能|可以|不能)",
+    ]
+    for pattern in dangerous_patterns:
+        if re.search(pattern, answer):
+            issues.append(f"工具路由型答案包含确定性结论: {pattern}")
+    if qa.get("tool_routing") and not qa.get("tool_params"):
+        issues.append("tool_routing 已设置但 tool_params 为空")
+    return issues
+
+
+# ============================================================
+# Stage 1: 格式校验
+# ============================================================
 
 
 def validate_format(qa: dict) -> dict:
@@ -84,15 +193,18 @@ def validate_format(qa: dict) -> dict:
 
 
 def run_format_check(qa_list: list[dict]) -> tuple[list[dict], list[dict]]:
-    """批量格式校验，返回 (通过列表, 失败列表)"""
+    """批量格式校验，返回 (通过列表, 失败列表)。格式校验前先做元数据归一化。"""
     passed, failed = [], []
 
     def check_one(qa):
+        normalize_metadata(qa)
         result = validate_format(qa)
-        if result["passed"]:
+        tool_issues = validate_tool_routing_safety(qa)
+        all_issues = result["issues"] + tool_issues
+        if not all_issues:
             return "pass", qa
         else:
-            qa["_qc_issues"] = result["issues"]
+            qa["_qc_issues"] = all_issues
             return "fail", qa
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
@@ -307,26 +419,38 @@ def _dedup_embedding_incremental(
             base_embs = executor.submit(
                 model.encode, baseline_questions, normalize_embeddings=True, show_progress_bar=False,
             ).result()
-        unique_embs = list(base_embs)
     else:
-        unique_embs = []
+        base_embs = None
+
+    # 预分配矩阵替代 list.append + np.stack，避免 10 万级时的内存抖动
+    max_unique = len(baseline_qa) + len(new_qa)
+    dim = new_embs.shape[1]
+    unique_matrix = np.zeros((max_unique, dim), dtype=np.float32)
+    unique_count = 0
+
+    if base_embs is not None and len(base_embs) > 0:
+        unique_matrix[:len(base_embs)] = base_embs
+        unique_count = len(base_embs)
 
     unique, duplicates = [], []
     LOG_EVERY = max(500, len(new_qa) // 10)
     for i, (qa, emb) in enumerate(zip(new_qa, new_embs)):
         if i > 0 and i % LOG_EVERY == 0:
             logger.info(f"增量去重进度: {i}/{len(new_qa)} ({i/len(new_qa):.0%})")
-        if not unique_embs:
+        if unique_count == 0:
             unique.append(qa)
-            unique_embs.append(emb)
+            unique_matrix[0] = emb
+            unique_count = 1
             continue
-        sims = np.stack(unique_embs) @ emb
+        # 切片计算，不重建矩阵
+        sims = unique_matrix[:unique_count] @ emb
         if float(sims.max()) > threshold:
             qa["_qc_issues"] = qa.get("_qc_issues", []) + ["语义重复"]
             duplicates.append(qa)
         else:
             unique.append(qa)
-            unique_embs.append(emb)
+            unique_matrix[unique_count] = emb
+            unique_count += 1
 
     logger.info(f"增量去重(embedding): {len(unique)} 唯一, {len(duplicates)} 重复")
     return unique, duplicates
@@ -338,22 +462,43 @@ def _dedup_embedding_incremental(
 # 保险领域可校验的硬性事实
 KNOWN_FACTS = {
     "交强险": {
-        "死亡伤残限额": 180000,
-        "医疗费用限额": 18000,
-        "财产损失限额": 2000,
+        "死亡伤残限额_现行": 180000,
+        "医疗费用限额_现行": 18000,
+        "财产损失限额_现行": 2000,
+        "无责死亡伤残限额": 18000,
+        "无责医疗费用限额": 1800,
+        "无责财产损失限额": 100,
     },
     "等待期": {
-        "重疾险_常见": [90, 180],        # 天
+        "重疾险_常见": [90, 180],
         "医疗险_常见": [30, 90],
         "寿险_常见": [90, 180],
     },
     "犹豫期": {
-        "长期险_最短": 15,                # 天
+        "长期险_最短": 15,
+    },
+    "宽限期": {
+        "最短": 60,
+    },
+    "复效期": {
+        "最长": 730,    # 2年 = 730天
+    },
+    "不可抗辩期": {
+        "期限": 730,    # 2年
+    },
+    "诉讼时效": {
+        "人寿险": 1825,   # 5年
+        "其他险": 730,    # 2年
+    },
+    "理赔核定": {
+        "核定时限": 30,     # 天
+        "支付时限": 10,     # 天
     },
     "法规": {
         "保险法_如实告知": "第十六条",
-        "保险法_不可抗辩": "第十六条第三款",
+        "保险法_不可抗辩": "第十六条",
         "保险法_代位求偿": "第六十条",
+        "保险法_索赔时效": "第二十六条",
     }
 }
 
@@ -418,24 +563,52 @@ def _check_facts(qa: dict) -> list[str]:
 
     # 检查交强险限额（含万元单位）
     if "交强险" in answer:
-        known_limits = {180000, 18000, 2000, 200000, 20000, 2500}  # 现行 + 旧版
+        known_limits = {180000, 18000, 2000, 200000, 20000, 2500, 18, 1800, 100}
         for amount in _parse_yuan(answer):
             if amount > 1000 and amount not in known_limits:
                 issues.append(f"交强险相关金额 {amount} 元不在已知限额范围内")
 
     # 检查等待期天数
-    if "等待期" in answer:
+    if "等待期" in answer or "观察期" in answer:
         for d in re.findall(r"(\d+)\s*(?:天|日|个自然日)", answer):
             d = int(d)
-            if d > 0 and d not in {30, 60, 90, 180, 365}:
-                issues.append(f"等待期 {d} 天不是常见取值")
+            if d > 0 and d not in {30, 60, 90, 120, 180, 365}:
+                issues.append(f"等待期 {d} 天不是常见取值（常见: 30/90/180天）")
 
     # 检查犹豫期天数
-    if "犹豫期" in answer:
+    if "犹豫期" in answer or "冷静期" in answer:
         for d in re.findall(r"(\d+)\s*(?:天|日)", answer):
             d = int(d)
             if d > 0 and d not in {10, 15, 20}:
-                issues.append(f"犹豫期 {d} 天不是常见取值")
+                issues.append(f"犹豫期 {d} 天不是常见取值（常见: 15/20天）")
+
+    # 检查宽限期天数（保险法规定最低60天）
+    if "宽限期" in answer or "缴费宽限" in answer:
+        for d in re.findall(r"(\d+)\s*(?:天|日)", answer):
+            d = int(d)
+            if 0 < d < 60:
+                issues.append(f"宽限期 {d} 天低于法定最低60天")
+
+    # 检查复效期（最长2年）
+    if "复效" in answer and "2年" not in answer and "两年" not in answer:
+        for y in re.findall(r"(\d+)\s*年", answer):
+            y = int(y)
+            if y > 2:
+                issues.append(f"复效期 {y} 年超过法定最长2年")
+
+    # 检查不可抗辩期（2年）
+    if "不可抗辩" in answer:
+        for y in re.findall(r"(\d+)\s*年", answer):
+            y = int(y)
+            if y != 2:
+                issues.append(f"不可抗辩期应为2年，答案中出现 {y} 年")
+
+    # 检查理赔核定时限（30天内核定，10天内支付）
+    if "理赔核定" in answer or "理赔决定" in answer:
+        for d in re.findall(r"(\d+)\s*(?:天|日)内.*核定", answer):
+            d = int(d)
+            if d > 30:
+                issues.append(f"理赔核定时限 {d} 天超过法定30天")
 
     return issues
 

@@ -258,6 +258,50 @@ async def reports_overview():
     return await asyncio.to_thread(_load)
 
 
+@router_data.get("/qa/ask")
+async def qa_ask(question: str):
+    """最小检索 + 路由验证（只读）。基于字符 bigram 相似度召回最相关的 5 条。"""
+    def _search():
+        from src.data_reader import _iter_jsonl
+
+        passed_file = BASE_DIR / "data" / "qc_results" / "qa_passed.jsonl"
+        if not passed_file.exists():
+            return {"question": question, "candidates": [], "tool_routing": None, "qa_categories": [], "total_candidates": 0}
+
+        q_lower = question.lower()
+        q_bigrams = {q_lower[i:i+2] for i in range(len(q_lower) - 1)}
+
+        scored = []
+        for qa in _iter_jsonl(passed_file):
+            target = qa.get("question", "").lower()
+            t_bigrams = {target[i:i+2] for i in range(len(target) - 1)}
+            if not q_bigrams or not t_bigrams:
+                continue
+            score = len(q_bigrams & t_bigrams) / len(q_bigrams)
+            if score > 0.3:
+                scored.append((score, qa))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        candidates = [qa for _, qa in scored[:5]]
+
+        tool_routing = None
+        if candidates and candidates[0].get("is_tool_routed"):
+            tool_routing = {
+                "tool": candidates[0]["tool_routing"],
+                "params": candidates[0].get("tool_params", {}),
+            }
+
+        return {
+            "question": question,
+            "candidates": candidates,
+            "tool_routing": tool_routing,
+            "qa_categories": [c.get("qa_category", "knowledge") for c in candidates],
+            "total_candidates": len(scored),
+        }
+
+    return await asyncio.to_thread(_search)
+
+
 # ─── Register routers & mount frontend ───────────────────────────────────────
 
 app.include_router(router_docs)

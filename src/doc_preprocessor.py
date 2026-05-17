@@ -65,6 +65,7 @@ class TextChunk:
     section_title: str = ""                 # 所属章节标题
     has_table: bool = False
     has_numbers: bool = False               # 是否包含金额/比例等数字
+    product_name: str = ""                  # 从正文提取的完整产品名
     metadata: dict = field(default_factory=dict)
 
 
@@ -232,11 +233,11 @@ def classify_document_with_llm(
     md5: str,
     config: dict,
     cache: dict,
-) -> tuple[str, str]:
-    """LLM 分类器：返回 (doc_type, insurance_type)。命中缓存直接返回；LLM 失败或返回非法值时回退正则结果。"""
+) -> tuple[str, str, str]:
+    """LLM 分类器：返回 (doc_type, insurance_type, product_name)。命中缓存直接返回；LLM 失败或返回非法值时回退正则结果。"""
     if md5 in cache:
         entry = cache[md5]
-        return entry["doc_type"], entry["insurance_type"]
+        return entry["doc_type"], entry["insurance_type"], entry.get("product_name", "")
 
     doc_types_list       = config.get("preprocessing", {}).get("doc_types", [])
     insurance_types_list = _get_insurance_types(config)
@@ -259,8 +260,9 @@ def classify_document_with_llm(
         response = re.sub(r"```(?:json)?\s*", "", response).strip()
         result   = json.loads(response)
 
-        doc_type = result.get("doc_type", "").strip()
-        ins_type = result.get("insurance_type", "").strip()
+        doc_type    = result.get("doc_type", "").strip()
+        ins_type    = result.get("insurance_type", "").strip()
+        product_name = result.get("product_name", "").strip()
 
         if doc_type not in doc_types_list:
             logger.warning(f"LLM doc_type '{doc_type}' 不在 schema，回退: {fallback_doc}")
@@ -269,12 +271,17 @@ def classify_document_with_llm(
             logger.warning(f"LLM insurance_type '{ins_type}' 不在 schema，回退: {fallback_ins}")
             ins_type = fallback_ins
 
+        # 锚定校验：产品名必须出现在正文前500字，否则丢弃（防止幻觉）
+        if product_name and product_name not in text[:500]:
+            logger.warning(f"product_name '{product_name}' 未在前500字出现，丢弃")
+            product_name = ""
+
     except Exception as e:
         logger.warning(f"LLM 分类失败 ({file_name}): {e}，使用正则结果")
-        doc_type, ins_type = fallback_doc, fallback_ins
+        doc_type, ins_type, product_name = fallback_doc, fallback_ins, ""
 
-    cache[md5] = {"doc_type": doc_type, "insurance_type": ins_type}
-    return doc_type, ins_type
+    cache[md5] = {"doc_type": doc_type, "insurance_type": ins_type, "product_name": product_name}
+    return doc_type, ins_type, product_name
 
 
 # ---------- 智能分块 ----------
@@ -423,7 +430,7 @@ def process_single_document(
 
     # 3. 分类文档类型和险种（LLM 优先，正则兜底）
     _cache = cache if cache is not None else {}
-    doc_type, insurance_type = classify_document_with_llm(file_name, text, md5, config, _cache)
+    doc_type, insurance_type, product_name = classify_document_with_llm(file_name, text, md5, config, _cache)
 
     # 4. 智能分块
     prep_config = config.get("preprocessing", {})
@@ -462,6 +469,7 @@ def process_single_document(
             section_title=raw_chunk.get("section_title", ""),
             has_table=raw_chunk.get("has_table", False),
             has_numbers=raw_chunk.get("has_numbers", False),
+            product_name=product_name,
         )
         chunks.append(chunk)
 

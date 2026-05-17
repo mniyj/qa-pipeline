@@ -260,6 +260,7 @@ async def _generate_seeds_async(
                         qa["source_chunk_id"] = chunk["chunk_id"]
                         qa["source_doc"] = chunk["doc_file"]
                         qa["insurance_type"] = chunk["insurance_type"]
+                        qa["product_name"] = chunk.get("product_name", "")
                         qa["generation_method"] = "seed_from_document"
                         qa["batch_id"] = batch_id
                         qa["created_at"] = datetime.now().isoformat()
