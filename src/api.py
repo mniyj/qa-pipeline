@@ -34,24 +34,108 @@ ALLOWED_EXTS = {".pdf", ".docx", ".doc", ".txt", ".md"}
 router_docs = APIRouter(prefix="/api/documents", tags=["documents"])
 
 
+def _safe_child(base: Path, rel: str) -> Path:
+    """Resolve rel under base and verify it stays within base (path-traversal guard)."""
+    target = (base / rel).resolve()
+    if not str(target).startswith(str(base.resolve())):
+        raise HTTPException(400, "非法路径")
+    return target
+
+
+def _build_tree(directory: Path, search: str = "") -> list:
+    """Recursively build the directory tree. Folders with no matching descendants
+    are omitted when a search keyword is active."""
+    kw = search.strip().lower()
+    items = []
+    try:
+        entries = sorted(directory.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    except PermissionError:
+        return []
+    for entry in entries:
+        if entry.name.startswith("."):
+            continue
+        if entry.is_dir():
+            children = _build_tree(entry, search)
+            if not kw or children:          # include folder only if it has hits
+                items.append({
+                    "type": "folder",
+                    "name": entry.name,
+                    "path": str(entry.relative_to(DOCS_DIR)),
+                    "children": children,
+                })
+        elif entry.is_file() and entry.suffix.lower() in ALLOWED_EXTS:
+            if not kw or kw in entry.name.lower():
+                items.append({
+                    "type": "file",
+                    "name": entry.name,
+                    "path": str(entry.relative_to(DOCS_DIR)),
+                    "size": entry.stat().st_size,
+                    "modified": entry.stat().st_mtime,
+                })
+    return items
+
+
+@router_docs.get("/tree")
+async def get_document_tree(search: str = ""):
+    DOCS_DIR.mkdir(parents=True, exist_ok=True)
+    tree = await asyncio.to_thread(_build_tree, DOCS_DIR, search)
+    total = sum(1 for p in DOCS_DIR.rglob("*") if p.is_file() and not p.name.startswith("."))
+    return {"tree": tree, "total": total}
+
+
 @router_docs.post("/upload")
-async def upload_document(file: UploadFile):
+async def upload_document(file: UploadFile, folder: str = ""):
     ext = Path(file.filename).suffix.lower()
     if ext not in ALLOWED_EXTS:
         raise HTTPException(400, f"不支持的格式: {ext}")
-    dest = DOCS_DIR / file.filename
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest_dir = _safe_child(DOCS_DIR, folder.strip("/")) if folder.strip("/") else DOCS_DIR
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / file.filename
     with open(dest, "wb") as f:
         shutil.copyfileobj(file.file, f)
-    return {"filename": file.filename, "size": dest.stat().st_size}
+    return {"filename": file.filename, "path": str(dest.relative_to(DOCS_DIR)), "size": dest.stat().st_size}
+
+
+@router_docs.post("/mkdir")
+async def make_directory(body: dict):
+    folder = body.get("path", "").strip("/")
+    if not folder:
+        raise HTTPException(400, "路径不能为空")
+    target = _safe_child(DOCS_DIR, folder)
+    target.mkdir(parents=True, exist_ok=True)
+    return {"created": str(target.relative_to(DOCS_DIR))}
+
+
+@router_docs.post("/move")
+async def move_document(body: dict):
+    src_rel = body.get("src", "").strip("/")
+    dest_folder_rel = body.get("dest_folder", "").strip("/")
+    if not src_rel:
+        raise HTTPException(400, "源路径不能为空")
+    src_path = _safe_child(DOCS_DIR, src_rel)
+    if not src_path.exists() or not src_path.is_file():
+        raise HTTPException(404, "文件不存在")
+    dest_dir = _safe_child(DOCS_DIR, dest_folder_rel) if dest_folder_rel else DOCS_DIR
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / src_path.name
+    if dest_path.resolve() == src_path.resolve():
+        return {"moved": False, "reason": "已在目标位置"}
+    if dest_path.exists():
+        raise HTTPException(409, f"目标位置已存在同名文件: {dest_path.name}")
+    shutil.move(str(src_path), str(dest_path))
+    return {"moved": True, "new_path": str(dest_path.relative_to(DOCS_DIR))}
 
 
 @router_docs.get("/")
-async def list_documents(page: int = 1, size: int = 50):
+async def list_documents(page: int = 1, size: int = 50, search: str = ""):
+    """Kept for backwards compatibility; tree endpoint is preferred."""
     all_files = []
+    kw = search.strip().lower()
     if DOCS_DIR.exists():
         for path in sorted(DOCS_DIR.rglob("*")):
             if path.is_file() and not path.name.startswith("."):
+                if kw and kw not in path.name.lower():
+                    continue
                 all_files.append({
                     "name": path.name,
                     "relative_path": str(path.relative_to(DOCS_DIR)),
@@ -62,21 +146,19 @@ async def list_documents(page: int = 1, size: int = 50):
     size = min(max(size, 1), 200)
     skip = (page - 1) * size
     items = all_files[skip:skip + size]
-    return {
-        "items": items,
-        "total": total,
-        "page": page,
-        "size": size,
-        "pages": max(1, (total + size - 1) // size),
-    }
+    return {"items": items, "total": total, "page": page, "size": size,
+            "pages": max(1, (total + size - 1) // size)}
 
 
 @router_docs.delete("/{filename:path}")
 async def delete_document(filename: str):
-    path = DOCS_DIR / filename
+    path = _safe_child(DOCS_DIR, filename)
     if not path.exists():
         raise HTTPException(404, "文件不存在")
-    path.unlink()
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
     return {"deleted": filename}
 
 
