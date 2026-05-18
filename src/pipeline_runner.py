@@ -196,7 +196,17 @@ def run_step(step: str):
                     break
 
             except Exception as e:
-                pipeline_state.update_step(s, status="error", error=str(e))
+                from llm_client import FatalAPIError
+                if isinstance(e, FatalAPIError):
+                    msg = {
+                        402: "API 余额不足，请充值后重试",
+                        401: "API 密钥无效，请检查配置",
+                        403: "API 访问被拒绝，请检查权限",
+                    }.get(e.status_code, str(e))
+                    pipeline_state.update_step(s, status="error", error=msg)
+                    pipeline_state.log(f"❌ {msg}", "ERROR")
+                else:
+                    pipeline_state.update_step(s, status="error", error=str(e))
                 raise
 
     finally:

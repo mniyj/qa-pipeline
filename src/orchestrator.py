@@ -99,12 +99,12 @@ def cmd_seed(config: dict, limit: int = None, pairs: int = 8, progress_callback=
 # ============================================================
 def cmd_seed_dedup(config: dict, progress_callback=None) -> dict:
     """
-    对所有种子文件做语义去重（embedding，无 LLM 调用），
+    增量语义去重：只处理新增/变更的种子文件，缓存 embedding 矩阵避免重复编码历史数据。
     将重复种子 ID 写入 expanded/seed_dedup_filter.json。
-    cmd_expand() 读取此文件跳过重复种子，避免浪费 token。
     """
+    import numpy as np
     paths = config["storage"]["paths"]
-    from quality_checker import run_seed_dedup_filter
+    from quality_checker import run_seed_dedup_incremental_with_cache
 
     def _progress(pct: int):
         if progress_callback:
@@ -119,36 +119,131 @@ def cmd_seed_dedup(config: dict, progress_callback=None) -> dict:
     expanded_dir = Path(paths["expanded"])
     expanded_dir.mkdir(parents=True, exist_ok=True)
 
-    # 检查种子文件自上次去重后是否有变化
     state_file  = expanded_dir / "seed_dedup_state.json"
     filter_file = expanded_dir / "seed_dedup_filter.json"
+    emb_file    = expanded_dir / "seed_dedup_embeddings.npy"
+    uid_file    = expanded_dir / "seed_dedup_unique_ids.json"
+
     current_state = {str(Path(f).resolve()): str(Path(f).stat().st_mtime) for f in seed_files}
-    if state_file.exists() and filter_file.exists():
-        with open(state_file, encoding="utf-8") as f:
-            prev_state = json.load(f)
-        if prev_state == current_state:
-            with open(filter_file, encoding="utf-8") as f:
-                skip_ids = json.load(f)
-            logger.info(f"种子前置去重: 种子文件无变化，复用已有过滤清单（{len(skip_ids)} 条重复）")
-            return {"skipped": True, "duplicate_count": len(skip_ids)}
+    prev_state: dict = {}
+    if state_file.exists():
+        with open(state_file, encoding="utf-8") as fh:
+            prev_state = json.load(fh)
 
-    _progress(20)  # 文件状态检查完成
-    unique_ids, duplicate_ids = run_seed_dedup_filter(seed_files)
-    _progress(80)  # embedding 计算完成
+    # 若 embedding 缓存不存在（首次运行或升级后），强制重建：清空 prev_state 让所有文件都进入处理
+    if not emb_file.exists():
+        logger.info("种子增量去重: embedding 缓存不存在，将处理全部种子文件以建立缓存")
+        prev_state = {}
 
-    with open(filter_file, "w", encoding="utf-8") as f:
-        json.dump(list(duplicate_ids), f, ensure_ascii=False)
-    with open(state_file, "w", encoding="utf-8") as f:
-        json.dump(current_state, f, ensure_ascii=False, indent=2)
+    # 找出新增或变更的种子文件
+    new_files = [
+        f for f in seed_files
+        if current_state.get(str(Path(f).resolve())) != prev_state.get(str(Path(f).resolve()))
+    ]
+
+    if not new_files and filter_file.exists():
+        with open(filter_file, encoding="utf-8") as fh:
+            skip_ids = json.load(fh)
+        logger.info(f"种子增量去重: 种子文件无变化，复用已有过滤清单（{len(skip_ids)} 条重复）")
+        return {"skipped": True, "duplicate_count": len(skip_ids)}
+
+    _progress(10)
+
+    # 加载已有过滤清单和唯一 ID 集
+    existing_dup_ids: set = set()
+    if filter_file.exists():
+        existing_dup_ids = set(json.loads(filter_file.read_text(encoding="utf-8")))
+
+    existing_unique_ids: list = []
+    if uid_file.exists():
+        existing_unique_ids = json.loads(uid_file.read_text(encoding="utf-8"))
+    existing_unique_id_set = set(existing_unique_ids)
+
+    # 加载缓存 embedding 矩阵
+    cached_matrix = None
+    if emb_file.exists():
+        try:
+            cached_matrix = np.load(str(emb_file))
+            logger.info(f"种子增量去重: 加载缓存 embedding 矩阵 {cached_matrix.shape}")
+            # 若 ID 列表与矩阵行数不一致，丢弃缓存重算
+            if len(existing_unique_ids) != len(cached_matrix):
+                logger.warning("embedding 缓存与 ID 列表行数不符，重置缓存")
+                cached_matrix = None
+                existing_unique_ids = []
+                existing_unique_id_set = set()
+        except Exception as e:
+            logger.warning(f"加载 embedding 缓存失败: {e}，将从头计算")
+            cached_matrix = None
+            existing_unique_ids = []
+            existing_unique_id_set = set()
+
+    # 只加载新/变更文件中尚未见过的种子
+    known_ids = existing_unique_id_set | existing_dup_ids
+    new_seeds: list[dict] = []
+    for f in new_files:
+        with open(f, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    qa = json.loads(line)
+                    if qa.get("id") and qa["id"] in known_ids:
+                        continue
+                    new_seeds.append(qa)
+                except json.JSONDecodeError:
+                    pass
 
     logger.info(
-        f"种子前置去重完成: 共 {len(unique_ids)+len(duplicate_ids)} 条 → "
-        f"保留 {len(unique_ids)} 条，跳过 {len(duplicate_ids)} 条重复"
+        f"种子增量去重: {len(new_files)} 个新/变更文件，{len(new_seeds)} 条待处理新种子"
+    )
+
+    if not new_seeds:
+        with open(state_file, "w", encoding="utf-8") as fh:
+            json.dump(current_state, fh, ensure_ascii=False, indent=2)
+        logger.info("无新种子，跳过去重计算")
+        return {"skipped": True, "duplicate_count": len(existing_dup_ids)}
+
+    _progress(20)
+
+    unique_new, dup_new, new_unique_embs = run_seed_dedup_incremental_with_cache(
+        new_seeds, cached_matrix
+    )
+
+    _progress(80)
+
+    # 更新 embedding 缓存
+    if new_unique_embs is not None and len(new_unique_embs) > 0:
+        updated_matrix = (
+            np.vstack([cached_matrix, new_unique_embs])
+            if cached_matrix is not None and len(cached_matrix) > 0
+            else new_unique_embs
+        )
+        np.save(str(emb_file), updated_matrix)
+        logger.info(f"更新 embedding 缓存: {updated_matrix.shape}")
+
+    # 更新唯一 ID 列表
+    new_unique_ids = [qa.get("id", "") for qa in unique_new if qa.get("id")]
+    all_unique_ids = existing_unique_ids + new_unique_ids
+    uid_file.write_text(json.dumps(all_unique_ids, ensure_ascii=False))
+
+    # 更新重复过滤清单
+    new_dup_ids = {qa.get("id", "") for qa in dup_new if qa.get("id")}
+    all_dup_ids = existing_dup_ids | new_dup_ids
+    filter_file.write_text(json.dumps(list(all_dup_ids), ensure_ascii=False))
+
+    # 保存当前文件状态（断点续传基准）
+    state_file.write_text(json.dumps(current_state, ensure_ascii=False, indent=2))
+
+    total = len(all_unique_ids) + len(all_dup_ids)
+    logger.info(
+        f"种子增量去重完成: 本批 {len(unique_new)} 唯一 + {len(dup_new)} 重复；"
+        f"累计 {len(all_unique_ids)} 唯一, {len(all_dup_ids)} 重复"
     )
     return {
-        "total": len(unique_ids) + len(duplicate_ids),
-        "unique": len(unique_ids),
-        "duplicates": len(duplicate_ids),
+        "total": total,
+        "unique": len(all_unique_ids),
+        "duplicates": len(all_dup_ids),
     }
 
 

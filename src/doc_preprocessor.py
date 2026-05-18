@@ -271,10 +271,20 @@ def classify_document_with_llm(
             logger.warning(f"LLM insurance_type '{ins_type}' 不在 schema，回退: {fallback_ins}")
             ins_type = fallback_ins
 
-        # 锚定校验：产品名必须出现在正文前500字，否则丢弃（防止幻觉）
-        if product_name and product_name not in text[:500]:
-            logger.warning(f"product_name '{product_name}' 未在前500字出现，丢弃")
-            product_name = ""
+        # 锚定校验：产品名出现在前500字视为高置信度；
+        # 出现在前2000字视为低置信度（附件/封底等位置）仍保留，但记录警告；
+        # 完全未出现则丢弃（防止 LLM 幻觉）。
+        if product_name:
+            if product_name in text[:500]:
+                pass  # 高置信度，直接保留
+            elif product_name in text[:2000]:
+                logger.warning(
+                    f"product_name '{product_name}' 仅在前2000字出现（低置信度），"
+                    "可能位于附件/封底，保留但下游应注意"
+                )
+            else:
+                logger.warning(f"product_name '{product_name}' 未在前2000字出现，丢弃（防幻觉）")
+                product_name = ""
 
         # 监管类文档不应有产品名，强制清空防止后续误用
         _REGULATORY_DOC_TYPES = {"法律法规", "监管文件", "行业标准"}

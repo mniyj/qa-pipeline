@@ -22,3 +22,5 @@ data/final/*
 .worktrees/
 .codebase-analysis.json
 .codebase-calls.json
+data/llm_logs/
+.~*

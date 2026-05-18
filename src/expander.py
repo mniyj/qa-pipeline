@@ -203,8 +203,7 @@ def load_seeds(file_path: str) -> list[dict]:
 # ============================================================
 # 扩展方式 1: 改述变体
 # ============================================================
-def score_seed(seed: dict) -> float:
-    """对种子 Q&A 质量评分（0.0-1.0），用于差异化扩展倍率。"""
+def _score_product_seed(seed: dict) -> float:
     score = 0.5
     answer = seed.get("answer", "")
     question = seed.get("question", "")
@@ -221,6 +220,36 @@ def score_seed(seed: dict) -> float:
     if seed.get("difficulty") == "专业":
         score += 0.1
     return min(1.0, max(0.0, score))
+
+
+def _score_regulatory_seed(seed: dict) -> float:
+    """监管/法规类种子评分：不依赖 product_name，重视法条引用和专业深度。"""
+    score = 0.5
+    answer = seed.get("answer", "")
+    if len(answer) < 50:
+        score -= 0.2
+    elif len(answer) > 150:
+        score += 0.1
+    # 法条引用是监管类核心质量指标，权重高于产品类
+    if re.search(r"第[一二三四五六七八九十\d]+条", answer):
+        score += 0.2
+    if re.search(r"\d+(?:元|万元|天|%|年)", answer):
+        score += 0.1
+    # 引用法规名称（《xxx》格式）
+    if re.search(r"《[^》]{2,30}》", answer):
+        score += 0.1
+    if seed.get("difficulty") == "专业":
+        score += 0.15
+    return min(1.0, max(0.0, score))
+
+
+def score_seed(seed: dict) -> float:
+    """对种子 Q&A 质量评分（0.0-1.0），用于差异化扩展倍率。
+    监管类和产品类使用不同评分维度，避免监管类因缺少 product_name 被低估。
+    """
+    if _is_regulatory_seed(seed):
+        return _score_regulatory_seed(seed)
+    return _score_product_seed(seed)
 
 
 def get_expansion_multiplier(seed: dict) -> tuple[int, int]:
@@ -350,6 +379,9 @@ async def _expand_rephrase_async(
                     logger.info(f"  → {len(variants)} 个变体（累计 {total_written}）")
                     return i, variants
                 except Exception as e:
+                    from llm_client import FatalAPIError
+                    if isinstance(e, FatalAPIError):
+                        raise
                     logger.error(f"  → 失败: {e}")
                     return i, []
             finally:
@@ -460,13 +492,19 @@ async def _expand_followup_async(
                     logger.info(f"  [{i+1}/{len(pending)}] 跳过（问题重复）: {question[:50]}...")
                     return i, []
 
+                # Pre-validate parent answer before building followup chain on it
+                parent_answer = seed.get("answer", seed.get("summary", seed.get("description", "")))
+                if len(parent_answer) < 20:
+                    logger.warning(f"  [{i+1}/{len(pending)}] 跳过（父答案过短，避免追问链基于错误内容）: {question[:50]}")
+                    return i, []
+
                 logger.info(f"[追问 {i+1}/{len(pending)}] {question[:50]}...")
                 tmpl = template_regulatory if _is_regulatory_seed(seed) else template_product
                 prompt = _safe_format(
                     tmpl,
                     chain_length=chain_length,
                     original_question=seed["question"],
-                    original_answer=seed.get("answer", seed.get("summary", seed.get("description", ""))),
+                    original_answer=parent_answer,
                     insurance_type=seed.get("insurance_type", "其他保险"),
                     parent_id=seed_id,
                 )
@@ -498,6 +536,9 @@ async def _expand_followup_async(
                     logger.info(f"  → {len(turns)} 轮追问（累计 {total_written}）")
                     return i, turns
                 except Exception as e:
+                    from llm_client import FatalAPIError
+                    if isinstance(e, FatalAPIError):
+                        raise
                     logger.error(f"  → 失败: {e}")
                     return i, []
             finally:

@@ -19,12 +19,33 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Lazy import to avoid circular deps; resolved on first call
+_llm_logger = None
+
+
+def _get_logger():
+    global _llm_logger
+    if _llm_logger is None:
+        try:
+            import llm_logger as _mod
+            _llm_logger = _mod
+        except ImportError:
+            pass
+    return _llm_logger
+
 
 class _RateLimitError(Exception):
     """429 限流错误，携带服务端建议的等待时间"""
     def __init__(self, retry_after: Optional[int] = None):
         self.retry_after = retry_after
         super().__init__(f"Rate limited (Retry-After={retry_after}s)")
+
+
+class FatalAPIError(Exception):
+    """不可重试的 API 错误（账户余额不足、鉴权失败等），应立即停止管道"""
+    def __init__(self, status_code: int, message: str):
+        self.status_code = status_code
+        super().__init__(f"HTTP {status_code}: {message}")
 
 
 @dataclass
@@ -89,6 +110,7 @@ class LLMClient:
         temperature: float = 0.7,
         max_retries: int = 3,
         requests_per_minute: int = 30,
+        stage: str = "unknown",
     ):
         self.provider = provider
         self.model = model
@@ -97,6 +119,7 @@ class LLMClient:
         self.max_retries = max_retries
         self.min_interval = 60.0 / requests_per_minute
         self._last_call_time = 0.0
+        self.stage = stage
 
     def _rate_limit(self):
         """简单的速率控制"""
@@ -116,24 +139,33 @@ class LLMClient:
         返回模型输出的文本
         """
         for attempt in range(self.max_retries):
+            t0 = time.time()
             try:
                 self._rate_limit()
 
                 if self.provider == "anthropic":
-                    result = self._call_anthropic(prompt, system)
+                    result, in_tok, out_tok = self._call_anthropic(prompt, system)
                 elif self.provider == "dashscope":
-                    result = self._call_dashscope(prompt, system)
+                    result, in_tok, out_tok = self._call_dashscope(prompt, system)
                 elif self.provider == "openai":
-                    result = self._call_openai(prompt, system)
+                    result, in_tok, out_tok = self._call_openai(prompt, system)
                 elif self.provider == "deepseek":
-                    result = self._call_deepseek(prompt, system)
+                    result, in_tok, out_tok = self._call_deepseek(prompt, system)
                 else:
                     raise ValueError(f"不支持的 provider: {self.provider}")
 
+                self._write_log_sync(prompt, system, result, in_tok, out_tok, int((time.time() - t0) * 1000), "success", "")
                 return result
+
+            except FatalAPIError as e:
+                usage_stats.failed_calls += 1
+                self._write_log_sync(prompt, system, "", 0, 0, int((time.time() - t0) * 1000), "failed", str(e))
+                logger.error(f"致命 API 错误，不重试: {e}")
+                raise
 
             except Exception as e:
                 usage_stats.failed_calls += 1
+                self._write_log_sync(prompt, system, "", 0, 0, int((time.time() - t0) * 1000), "failed", str(e))
                 wait = (2 ** attempt) * 2  # 2, 4, 8 秒
                 logger.warning(
                     f"调用失败 (尝试 {attempt+1}/{self.max_retries}): {e}. "
@@ -145,7 +177,53 @@ class LLMClient:
                     logger.error(f"调用彻底失败: {e}")
                     raise
 
-    def _call_anthropic(self, prompt: str, system: str) -> str:
+    def _write_log_sync(self, prompt: str, system: str, response: str,
+                        in_tok: int, out_tok: int, duration_ms: int, status: str, error: str):
+        mod = _get_logger()
+        if not mod:
+            return
+        pricing = UsageStats.PRICING.get(self.model, {"input": 0.01, "output": 0.03})
+        cost = in_tok / 1000 * pricing["input"] + out_tok / 1000 * pricing["output"]
+        record = mod.make_record(
+            stage=self.stage,
+            provider=self.provider,
+            model=self.model,
+            prompt=prompt,
+            system=system,
+            response=response,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            cost_yuan=cost,
+            duration_ms=duration_ms,
+            status=status,
+            error=error,
+        )
+        mod.write_log(record)
+
+    async def _write_log_async(self, prompt: str, system: str, response: str,
+                               in_tok: int, out_tok: int, duration_ms: int, status: str, error: str):
+        mod = _get_logger()
+        if not mod:
+            return
+        pricing = UsageStats.PRICING.get(self.model, {"input": 0.01, "output": 0.03})
+        cost = in_tok / 1000 * pricing["input"] + out_tok / 1000 * pricing["output"]
+        record = mod.make_record(
+            stage=self.stage,
+            provider=self.provider,
+            model=self.model,
+            prompt=prompt,
+            system=system,
+            response=response,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            cost_yuan=cost,
+            duration_ms=duration_ms,
+            status=status,
+            error=error,
+        )
+        await mod.awrite_log(record)
+
+    def _call_anthropic(self, prompt: str, system: str) -> tuple[str, int, int]:
         """调用 Anthropic Claude API"""
         import anthropic
 
@@ -163,109 +241,63 @@ class LLMClient:
             kwargs["system"] = system
 
         response = client.messages.create(**kwargs)
+        in_tok, out_tok = response.usage.input_tokens, response.usage.output_tokens
+        usage_stats.track(self.model, in_tok, out_tok)
+        return response.content[0].text, in_tok, out_tok
 
-        # 跟踪 token 使用量
-        usage_stats.track(
-            self.model,
-            response.usage.input_tokens,
-            response.usage.output_tokens,
-        )
-
-        return response.content[0].text
-
-    def _call_dashscope(self, prompt: str, system: str) -> str:
-        """
-        调用通义千问 (DashScope) API
-        文档：https://help.aliyun.com/zh/model-studio/
-        """
+    def _call_openai_compat_sync(
+        self, prompt: str, system: str, api_key: str, base_url: str
+    ) -> tuple[str, int, int]:
+        """通用 OpenAI-compat 同步调用，统一处理致命错误。"""
         import openai as openai_module
 
-        # DashScope 兼容 OpenAI SDK
-        client = openai_module.OpenAI(
-            api_key=os.environ.get("DASHSCOPE_API_KEY"),
+        client = openai_module.OpenAI(api_key=api_key, base_url=base_url)
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        try:
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                max_tokens=self.max_tokens,
+                temperature=self.temperature,
+            )
+        except openai_module.APIStatusError as e:
+            if e.status_code in (401, 402, 403):
+                raise FatalAPIError(e.status_code, str(e)) from e
+            raise
+
+        in_tok = out_tok = 0
+        if response.usage:
+            in_tok, out_tok = response.usage.prompt_tokens, response.usage.completion_tokens
+            usage_stats.track(self.model, in_tok, out_tok)
+        return response.choices[0].message.content, in_tok, out_tok
+
+    def _call_dashscope(self, prompt: str, system: str) -> tuple[str, int, int]:
+        """调用通义千问 (DashScope) API"""
+        return self._call_openai_compat_sync(
+            prompt, system,
+            api_key=os.environ.get("DASHSCOPE_API_KEY", ""),
             base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
         )
 
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-        )
-
-        # 跟踪用量
-        if response.usage:
-            usage_stats.track(
-                self.model,
-                response.usage.prompt_tokens,
-                response.usage.completion_tokens,
-            )
-
-        return response.choices[0].message.content
-
-    def _call_deepseek(self, prompt: str, system: str) -> str:
+    def _call_deepseek(self, prompt: str, system: str) -> tuple[str, int, int]:
         """调用 DeepSeek API（兼容 OpenAI SDK）"""
-        import openai as openai_module
-
-        client = openai_module.OpenAI(
-            api_key=os.environ.get("DEEPSEEK_API_KEY"),
+        return self._call_openai_compat_sync(
+            prompt, system,
+            api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
             base_url="https://api.deepseek.com",
         )
 
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-        )
-
-        if response.usage:
-            usage_stats.track(
-                self.model,
-                response.usage.prompt_tokens,
-                response.usage.completion_tokens,
-            )
-
-        return response.choices[0].message.content
-
-    def _call_openai(self, prompt: str, system: str) -> str:
+    def _call_openai(self, prompt: str, system: str) -> tuple[str, int, int]:
         """调用 OpenAI API"""
-        import openai as openai_module
-
-        client = openai_module.OpenAI(
-            api_key=os.environ.get("OPENAI_API_KEY")
+        return self._call_openai_compat_sync(
+            prompt, system,
+            api_key=os.environ.get("OPENAI_API_KEY", ""),
+            base_url="https://api.openai.com/v1",
         )
-
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-        )
-
-        if response.usage:
-            usage_stats.track(
-                self.model,
-                response.usage.prompt_tokens,
-                response.usage.completion_tokens,
-            )
-
-        return response.choices[0].message.content
 
     def call_batch(
         self,
@@ -299,20 +331,29 @@ class LLMClient:
         }
 
         for attempt in range(self.max_retries):
+            t0 = time.time()
             try:
                 if self.provider in _BASE_URLS:
-                    return await self._acall_openai_compat(
+                    result, in_tok, out_tok = await self._acall_openai_compat(
                         prompt, system,
                         _BASE_URLS[self.provider],
                         _API_KEYS[self.provider],
                     )
                 elif self.provider == "anthropic":
-                    return await self._acall_anthropic(prompt, system)
+                    result, in_tok, out_tok = await self._acall_anthropic(prompt, system)
                 else:
                     raise ValueError(f"不支持的 provider: {self.provider}")
-            except _RateLimitError as e:
-                # 429 限流：优先使用 Retry-After，否则指数退避（最少 10s）
+                await self._write_log_async(prompt, system, result, in_tok, out_tok, int((time.time() - t0) * 1000), "success", "")
+                return result
+            except FatalAPIError as e:
                 usage_stats.failed_calls += 1
+                await self._write_log_async(prompt, system, "", 0, 0, int((time.time() - t0) * 1000), "failed", str(e))
+                logger.error(f"致命 API 错误，不重试: {e}")
+                raise
+
+            except _RateLimitError as e:
+                usage_stats.failed_calls += 1
+                await self._write_log_async(prompt, system, "", 0, 0, int((time.time() - t0) * 1000), "failed", str(e))
                 wait = e.retry_after if e.retry_after else max(10, (2 ** attempt) * 5)
                 logger.warning(
                     f"触发限流 429 (尝试 {attempt+1}/{self.max_retries})，"
@@ -322,8 +363,10 @@ class LLMClient:
                     await asyncio.sleep(wait)
                 else:
                     raise
+
             except Exception as e:
                 usage_stats.failed_calls += 1
+                await self._write_log_async(prompt, system, "", 0, 0, int((time.time() - t0) * 1000), "failed", str(e))
                 wait = (2 ** attempt) * 2
                 logger.warning(f"async 调用失败 (尝试 {attempt+1}/{self.max_retries}): {e}. 等待 {wait}s...")
                 if attempt < self.max_retries - 1:
@@ -333,7 +376,7 @@ class LLMClient:
 
     async def _acall_openai_compat(
         self, prompt: str, system: str, base_url: str, api_key: str
-    ) -> str:
+    ) -> tuple[str, int, int]:
         import httpx
 
         messages = []
@@ -353,21 +396,20 @@ class LLMClient:
                 },
             )
             if response.status_code == 429:
-                # 尊重服务端返回的 Retry-After，而不是盲目使用指数退避
                 retry_after = int(response.headers.get("Retry-After", 0)) or None
                 raise _RateLimitError(retry_after=retry_after)
+            if response.status_code in (401, 402, 403):
+                raise FatalAPIError(response.status_code, response.text[:300])
             response.raise_for_status()
             data = response.json()
 
         usage = data.get("usage", {})
-        usage_stats.track(
-            self.model,
-            usage.get("prompt_tokens", 0),
-            usage.get("completion_tokens", 0),
-        )
-        return data["choices"][0]["message"]["content"]
+        in_tok  = usage.get("prompt_tokens", 0)
+        out_tok = usage.get("completion_tokens", 0)
+        usage_stats.track(self.model, in_tok, out_tok)
+        return data["choices"][0]["message"]["content"], in_tok, out_tok
 
-    async def _acall_anthropic(self, prompt: str, system: str) -> str:
+    async def _acall_anthropic(self, prompt: str, system: str) -> tuple[str, int, int]:
         import anthropic
 
         client = anthropic.AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
@@ -380,8 +422,9 @@ class LLMClient:
         if system:
             kwargs["system"] = system
         response = await client.messages.create(**kwargs)
-        usage_stats.track(self.model, response.usage.input_tokens, response.usage.output_tokens)
-        return response.content[0].text
+        in_tok, out_tok = response.usage.input_tokens, response.usage.output_tokens
+        usage_stats.track(self.model, in_tok, out_tok)
+        return response.content[0].text, in_tok, out_tok
 
 
 def create_client(config: dict, stage: str) -> LLMClient:
@@ -395,4 +438,5 @@ def create_client(config: dict, stage: str) -> LLMClient:
         model=model_config.get("model", "qwen-plus"),
         max_tokens=model_config.get("max_tokens", 4096),
         temperature=model_config.get("temperature", 0.7),
+        stage=stage,
     )

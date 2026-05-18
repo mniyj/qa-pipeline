@@ -352,7 +352,7 @@ const PageDocuments = {
     }
 
     async function delFolder(path) {
-      if (!confirm(\`确认删除文件夹 "\${path}" 及其所有内容？\`)) return;
+      if (!confirm('确认删除文件夹 "' + path + '" 及其所有内容？')) return;
       await apiFetch('/api/documents/' + path, { method: 'DELETE' });
       expanded.delete(path);
       if (activeFolder.value === path) activeFolder.value = '';
@@ -709,10 +709,23 @@ const PageQA = {
             <option value="rejected">质检拒绝</option>
           </select>
         </div>
+        <div class="flex flex-col gap-1 min-w-48">
+          <label class="text-xs text-gray-400">来源文档</label>
+          <input v-model="filters.source_doc" @keyup.enter="loadPage(1)" type="text"
+                 placeholder="文档名关键词后回车…" class="border rounded px-3 py-1.5 text-xs" />
+        </div>
         <div class="flex flex-col gap-1 flex-1 min-w-40">
           <label class="text-xs text-gray-400">搜索问题</label>
           <input v-model="searchText" @keyup.enter="loadPage(1)" type="text"
                  placeholder="输入关键词后回车…" class="border rounded px-3 py-1.5 text-xs" />
+        </div>
+        <div class="flex flex-col gap-1">
+          <label class="text-xs text-gray-400">排序</label>
+          <select v-model="filters.sort" @change="loadPage(1)"
+                  class="border rounded px-2 py-1.5 text-xs bg-white">
+            <option value="newest">最新优先</option>
+            <option value="oldest">最早优先</option>
+          </select>
         </div>
         <div class="flex flex-col gap-1">
           <label class="text-xs text-gray-400">每页</label>
@@ -801,7 +814,7 @@ const PageQA = {
     </div>
   `,
   setup() {
-    const filters = reactive({ status: 'passed', insurance_type: '', difficulty: '', question_type: '', generation_method: '' });
+    const filters = reactive({ status: 'passed', insurance_type: '', difficulty: '', question_type: '', generation_method: '', source_doc: '', sort: 'newest' });
     const searchText = ref('');
     const pageSize   = ref(20);
     const jumpTo     = ref(1);
@@ -830,6 +843,8 @@ const PageQA = {
         difficulty:        filters.difficulty,
         question_type:     filters.question_type,
         generation_method: filters.generation_method,
+        source_doc:        filters.source_doc,
+        sort:              filters.sort,
         search:            searchText.value,
       });
       const r = await apiFetch('/api/data/qa?' + p);
@@ -841,7 +856,7 @@ const PageQA = {
     function toggle(i)  { expanded.value = expanded.value === i ? null : i; }
     function trunc(s, n) { return s && s.length > n ? s.slice(0, n) + '…' : (s || ''); }
     function reset() {
-      Object.assign(filters, { status: 'passed', insurance_type: '', difficulty: '', question_type: '', generation_method: '' });
+      Object.assign(filters, { status: 'passed', insurance_type: '', difficulty: '', question_type: '', generation_method: '', source_doc: '', sort: 'newest' });
       searchText.value = ''; loadPage(1);
     }
     function diffBadge(d) {
@@ -977,6 +992,250 @@ const PageReports = {
 
     onMounted(load);
     return { ov, rejections, insChartEl, diffChartEl, n };
+  },
+};
+
+// ─── Page: LLM 日志 ───────────────────────────────────────────────────────────
+const PageLogs = {
+  template: `
+  <div>
+    <h2 class="text-base font-semibold mb-1">LLM 调用日志</h2>
+    <p class="text-gray-500 text-xs mb-4">记录每次与 LLM 的输入输出，可按阶段、模型、状态筛选，支持关键词搜索。</p>
+
+    <!-- Stats bar -->
+    <div v-if="stats.total" class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+      <div class="bg-white rounded-lg border px-4 py-3">
+        <div class="text-xs text-gray-500">总调用次数</div>
+        <div class="text-xl font-semibold text-gray-800 mt-0.5">{{ stats.total.toLocaleString() }}</div>
+        <div class="text-xs mt-1">
+          <span class="text-green-600">✓ {{ stats.success }}</span>
+          <span class="text-red-500 ml-2">✗ {{ stats.failed }}</span>
+        </div>
+      </div>
+      <div class="bg-white rounded-lg border px-4 py-3">
+        <div class="text-xs text-gray-500">Token 用量</div>
+        <div class="text-xl font-semibold text-gray-800 mt-0.5">{{ fmtNum(stats.total_input_tokens + stats.total_output_tokens) }}</div>
+        <div class="text-xs text-gray-400 mt-1">输入 {{ fmtNum(stats.total_input_tokens) }} / 输出 {{ fmtNum(stats.total_output_tokens) }}</div>
+      </div>
+      <div class="bg-white rounded-lg border px-4 py-3">
+        <div class="text-xs text-gray-500">估算成本</div>
+        <div class="text-xl font-semibold text-gray-800 mt-0.5">¥{{ stats.total_cost_yuan.toFixed(2) }}</div>
+        <div class="text-xs text-gray-400 mt-1">人民币，按单价估算</div>
+      </div>
+      <div class="bg-white rounded-lg border px-4 py-3">
+        <div class="text-xs text-gray-500">成功率</div>
+        <div class="text-xl font-semibold mt-0.5"
+             :class="successRate >= 95 ? 'text-green-600' : successRate >= 80 ? 'text-yellow-600' : 'text-red-600'">
+          {{ successRate }}%
+        </div>
+        <div class="text-xs text-gray-400 mt-1">{{ stats.failed }} 次失败</div>
+      </div>
+    </div>
+
+    <!-- Filters -->
+    <div class="flex flex-wrap gap-2 mb-3 items-center">
+      <input v-model="searchText" @keyup.enter="loadPage(1)" placeholder="搜索 prompt / response…"
+             class="border rounded px-2.5 py-1.5 text-xs w-56 focus:outline-none focus:ring-1 focus:ring-blue-400" />
+      <select v-model="filters.stage" @change="loadPage(1)"
+              class="border rounded px-2 py-1.5 text-xs focus:outline-none">
+        <option value="">全部阶段</option>
+        <option v-for="s in filterOpts.stages" :key="s" :value="s">{{ stageLabel(s) }}</option>
+      </select>
+      <select v-model="filters.model" @change="loadPage(1)"
+              class="border rounded px-2 py-1.5 text-xs focus:outline-none">
+        <option value="">全部模型</option>
+        <option v-for="m in filterOpts.models" :key="m" :value="m">{{ m }}</option>
+      </select>
+      <select v-model="filters.status" @change="loadPage(1)"
+              class="border rounded px-2 py-1.5 text-xs focus:outline-none">
+        <option value="">全部状态</option>
+        <option value="success">成功</option>
+        <option value="failed">失败</option>
+      </select>
+      <div class="flex items-center gap-1 text-xs text-gray-500">
+        <span>时间</span>
+        <input type="date" v-model="filters.start_time"
+               class="border rounded px-1.5 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400" />
+        <span>—</span>
+        <input type="date" v-model="filters.end_time"
+               class="border rounded px-1.5 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400" />
+      </div>
+      <button @click="reset" class="text-xs text-gray-400 hover:text-gray-700 px-2 py-1.5 border rounded">重置</button>
+      <button @click="loadPage(1)" class="text-xs bg-blue-600 text-white px-3 py-1.5 rounded hover:bg-blue-700">搜索</button>
+      <span class="text-xs text-gray-400 ml-auto">共 {{ result.total.toLocaleString() }} 条</span>
+    </div>
+
+    <!-- Table -->
+    <div class="bg-white rounded-lg border overflow-hidden">
+      <div v-if="loading" class="py-10 text-center text-gray-400 text-sm">加载中…</div>
+      <div v-else-if="!result.items.length" class="py-10 text-center text-gray-400 text-sm">暂无日志记录</div>
+      <table v-else class="w-full text-xs">
+        <thead class="bg-gray-50 border-b">
+          <tr>
+            <th class="text-left px-3 py-2 font-medium text-gray-500 w-32">时间</th>
+            <th class="text-left px-3 py-2 font-medium text-gray-500 w-24">阶段</th>
+            <th class="text-left px-3 py-2 font-medium text-gray-500 w-28 hidden md:table-cell">模型</th>
+            <th class="text-left px-3 py-2 font-medium text-gray-500 w-16">状态</th>
+            <th class="text-left px-3 py-2 font-medium text-gray-500 w-24 hidden lg:table-cell">Tokens 入/出</th>
+            <th class="text-left px-3 py-2 font-medium text-gray-500 w-16 hidden lg:table-cell">成本(¥)</th>
+            <th class="text-left px-3 py-2 font-medium text-gray-500 w-16 hidden md:table-cell">耗时</th>
+            <th class="text-left px-3 py-2 font-medium text-gray-500">Prompt 预览</th>
+          </tr>
+        </thead>
+        <tbody>
+          <template v-for="(item, i) in result.items" :key="item.call_id">
+            <tr class="border-b hover:bg-gray-50 cursor-pointer transition-colors"
+                :class="expanded === i ? 'bg-blue-50' : ''"
+                @click="toggle(i)">
+              <td class="px-3 py-2 text-gray-400 whitespace-nowrap">{{ fmtTime(item.timestamp) }}</td>
+              <td class="px-3 py-2">
+                <span :class="stageBadge(item.stage)">{{ stageLabel(item.stage) }}</span>
+              </td>
+              <td class="px-3 py-2 text-gray-500 hidden md:table-cell">{{ item.model }}</td>
+              <td class="px-3 py-2">
+                <span :class="item.status === 'success'
+                  ? 'px-1.5 py-0.5 rounded text-xs bg-green-50 text-green-700'
+                  : 'px-1.5 py-0.5 rounded text-xs bg-red-50 text-red-600'">
+                  {{ item.status === 'success' ? '成功' : '失败' }}
+                </span>
+              </td>
+              <td class="px-3 py-2 text-gray-500 hidden lg:table-cell whitespace-nowrap">
+                {{ item.input_tokens.toLocaleString() }} / {{ item.output_tokens.toLocaleString() }}
+              </td>
+              <td class="px-3 py-2 text-gray-500 hidden lg:table-cell">{{ item.cost_yuan > 0 ? item.cost_yuan.toFixed(4) : '—' }}</td>
+              <td class="px-3 py-2 text-gray-400 hidden md:table-cell whitespace-nowrap">{{ item.duration_ms ? item.duration_ms + 'ms' : '—' }}</td>
+              <td class="px-3 py-2 text-gray-600 truncate max-w-xs">{{ item.prompt_preview }}</td>
+            </tr>
+            <!-- Expanded detail -->
+            <tr v-if="expanded === i" class="bg-blue-50 border-b">
+              <td colspan="8" class="px-4 py-4">
+                <div v-if="item.error" class="mb-3 p-2 bg-red-50 border border-red-200 rounded text-xs text-red-700">
+                  <strong>错误：</strong>{{ item.error }}
+                </div>
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  <div>
+                    <div class="text-xs font-semibold text-gray-500 mb-1 flex items-center gap-1">
+                      📥 Prompt
+                      <span class="font-normal text-gray-400 ml-auto">{{ item.input_tokens }} tokens</span>
+                    </div>
+                    <div v-if="item.system" class="mb-2 p-2 bg-yellow-50 border border-yellow-200 rounded text-xs text-yellow-800 whitespace-pre-wrap break-all">
+                      <strong>[System]</strong> {{ item.system }}
+                    </div>
+                    <pre class="bg-gray-900 text-green-300 rounded p-3 text-xs overflow-auto max-h-80 whitespace-pre-wrap break-all">{{ item.prompt }}</pre>
+                  </div>
+                  <div>
+                    <div class="text-xs font-semibold text-gray-500 mb-1 flex items-center gap-1">
+                      📤 Response
+                      <span class="font-normal text-gray-400 ml-auto">{{ item.output_tokens }} tokens · {{ item.duration_ms }}ms</span>
+                    </div>
+                    <pre class="bg-gray-900 text-blue-200 rounded p-3 text-xs overflow-auto max-h-80 whitespace-pre-wrap break-all">{{ item.response || '（无响应）' }}</pre>
+                  </div>
+                </div>
+              </td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Pagination -->
+    <div v-if="result.pages > 1" class="flex items-center gap-1 mt-3 text-xs">
+      <button @click="loadPage(1)" :disabled="result.page<=1" class="px-2 py-1 border rounded disabled:opacity-30">«</button>
+      <button @click="loadPage(result.page-1)" :disabled="result.page<=1" class="px-2 py-1 border rounded disabled:opacity-30">‹</button>
+      <span class="px-3 text-gray-500">{{ result.page }} / {{ result.pages }}</span>
+      <button @click="loadPage(result.page+1)" :disabled="result.page>=result.pages" class="px-2 py-1 border rounded disabled:opacity-30">›</button>
+      <button @click="loadPage(result.pages)" :disabled="result.page>=result.pages" class="px-2 py-1 border rounded disabled:opacity-30">»</button>
+    </div>
+  </div>
+  `,
+  setup() {
+    const filters    = reactive({ stage: '', model: '', status: '', start_time: '', end_time: '' });
+    const searchText = ref('');
+    const loading    = ref(false);
+    const expanded   = ref(null);
+    const stats      = reactive({ total: 0, success: 0, failed: 0,
+                                   total_input_tokens: 0, total_output_tokens: 0,
+                                   total_cost_yuan: 0, stages: {}, models: {} });
+    const filterOpts = ref({ stages: [], models: [] });
+    const result     = reactive({ items: [], total: 0, page: 1, size: 20, pages: 1 });
+
+    const successRate = computed(() =>
+      stats.total ? Math.round(stats.success / stats.total * 100) : 0
+    );
+
+    async function loadStats() {
+      const r = await apiFetch('/api/logs/stats');
+      Object.assign(stats, await r.json());
+    }
+
+    async function loadFilterOpts() {
+      const r = await apiFetch('/api/logs/filters');
+      filterOpts.value = await r.json();
+    }
+
+    async function loadPage(page = 1) {
+      loading.value = true;
+      expanded.value = null;
+      const p = new URLSearchParams({
+        page, size: 20,
+        stage:      filters.stage,
+        model:      filters.model,
+        status:     filters.status,
+        search:     searchText.value,
+        start_time: filters.start_time,
+        end_time:   filters.end_time,
+      });
+      const r = await apiFetch('/api/logs?' + p);
+      Object.assign(result, await r.json());
+      loading.value = false;
+    }
+
+    function toggle(i) { expanded.value = expanded.value === i ? null : i; }
+
+    function reset() {
+      Object.assign(filters, { stage: '', model: '', status: '', start_time: '', end_time: '' });
+      searchText.value = '';
+      loadPage(1);
+    }
+
+    function fmtTime(ts) {
+      if (!ts) return '—';
+      return ts.replace('T', ' ').slice(0, 19);
+    }
+
+    function fmtNum(n) {
+      return n >= 1000000 ? (n / 1000000).toFixed(1) + 'M'
+           : n >= 1000    ? (n / 1000).toFixed(1)    + 'K'
+           : (n || 0).toString();
+    }
+
+    function stageLabel(s) {
+      const map = {
+        seed_generation: '种子生成',
+        expansion: '扩展',
+        quality_check: '质检',
+        unknown: '未知',
+      };
+      return map[s] || s;
+    }
+
+    function stageBadge(s) {
+      const colors = {
+        seed_generation: 'px-1.5 py-0.5 rounded bg-purple-50 text-purple-700',
+        expansion:       'px-1.5 py-0.5 rounded bg-blue-50 text-blue-700',
+        quality_check:   'px-1.5 py-0.5 rounded bg-orange-50 text-orange-700',
+      };
+      return colors[s] || 'px-1.5 py-0.5 rounded bg-gray-100 text-gray-600';
+    }
+
+    onMounted(() => {
+      loadStats();
+      loadFilterOpts();
+      loadPage(1);
+    });
+
+    return { filters, searchText, loading, expanded, stats, filterOpts, result,
+             successRate, loadPage, toggle, reset, fmtTime, fmtNum, stageLabel, stageBadge };
   },
 };
 
@@ -1937,6 +2196,7 @@ const navItems = [
   { key: 'chunks',    label: 'Chunks',   icon: '📦' },
   { key: 'qa',        label: 'Q&A 浏览', icon: '💬' },
   { key: 'reports',   label: '数据报告', icon: '📊' },
+  { key: 'logs',      label: 'LLM 日志', icon: '🔍' },
 ];
 const pages = {
   guide:     PageGuide,
@@ -1945,6 +2205,7 @@ const pages = {
   chunks:    PageChunks,
   qa:        PageQA,
   reports:   PageReports,
+  logs:      PageLogs,
 };
 
 createApp({

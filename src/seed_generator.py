@@ -232,15 +232,32 @@ async def _generate_seeds_async(
                 )
                 doc_file = chunk.get("doc_file", "")
                 doc_type = chunk["doc_type"]
+                product_name = chunk.get("product_name", "")
                 product_header = f"【来源产品：{doc_file}】\n\n" if doc_file else ""
+
+                # Disclaimer is appended by Python, not by LLM, to prevent modification/truncation
                 if doc_type in ("法律法规", "监管文件", "行业标准"):
-                    disclaimer = (
-                        "答案末尾必须附加一句免责提示："
-                        f"以上内容依据{doc_file}，法规条款可能随监管政策调整而变化，"
-                        "请以最新发布的官方文件为准。"
+                    legal_disclaimer = (
+                        f"\n\n（以上内容依据{doc_file}，"
+                        "法规条款可能随监管政策调整而变化，请以最新发布的官方文件为准。）"
                     )
                 else:
-                    disclaimer = "答案末尾无需附加免责提示。"
+                    legal_disclaimer = ""
+
+                # product_name requirement: only enforce when chunk has a known product name
+                if product_name:
+                    product_name_requirement = (
+                        f'**产品类文档问题中必须包含该产品名称「{product_name}」**'
+                        f'（例如「{product_name}的犹豫期是多少天？」，而不是「犹豫期是多少天？」）'
+                    )
+                elif doc_type not in ("法律法规", "监管文件", "行业标准"):
+                    product_name_requirement = (
+                        "若文档中明确提及特定产品名称，问题中应包含该名称；"
+                        "若无特定产品名称（通用条款），则无需强制包含，不得自行编造产品名称。"
+                    )
+                else:
+                    product_name_requirement = ""
+
                 prompt = prompt_template.format(
                     num_pairs=pairs_per_chunk,
                     doc_type=doc_type,
@@ -248,7 +265,7 @@ async def _generate_seeds_async(
                     section_title=chunk.get("section_title", ""),
                     doc_file=doc_file,
                     document_content=product_header + chunk_text,
-                    disclaimer=disclaimer,
+                    product_name_requirement=product_name_requirement,
                 )
                 try:
                     response = await client.acall(prompt)
@@ -265,6 +282,9 @@ async def _generate_seeds_async(
                         qa["generation_method"] = "seed_from_document"
                         qa["batch_id"] = batch_id
                         qa["created_at"] = datetime.now().isoformat()
+                        # Append standardized disclaimer in Python so LLM cannot modify it
+                        if legal_disclaimer:
+                            qa["answer"] = qa.get("answer", "").rstrip() + legal_disclaimer
                     # 归一化难度值，过滤空答案
                     qa_pairs = [_normalize_qa(qa) for qa in qa_pairs]
                     qa_pairs = [qa for qa in qa_pairs if _is_valid_qa(qa)]

@@ -37,11 +37,17 @@ VALID_QUESTION_TYPES = {
     "产品对比", "澄清引导",
 }
 VALID_BUSINESS_STAGES = {
+    # 产品类文档：保险业务流程节点
     "投保咨询", "健康告知", "核保", "承保生效",
     "保全变更", "续保复效", "报案", "理赔材料",
-    "理赔审核", "赔付结案", "拒赔争议", "通用",
+    "理赔审核", "赔付结案", "拒赔争议",
+    # 法规类文档专属
+    "合规监管", "消费者权益",
+    # 通用兜底
+    "通用",
 }
 STAGE_NORMALIZE = {
+    # 产品类同义词归一化
     "产品设计": "投保咨询", "精算定价": "投保咨询",
     "销售展业": "投保咨询", "投保告知": "健康告知",
     "承保出单": "承保生效", "续保续费": "续保复效",
@@ -50,6 +56,11 @@ STAGE_NORMALIZE = {
     "销售": "投保咨询", "承保": "承保生效",
     "保全": "保全变更", "续保": "续保复效",
     "拒赔": "拒赔争议",
+    # 法规类同义词归一化
+    "监管合规": "合规监管", "法规解读": "合规监管",
+    "合规": "合规监管", "监管": "合规监管",
+    "消费者保护": "消费者权益", "投诉处理": "消费者权益",
+    "权益保障": "消费者权益",
 }
 VALID_QA_CATEGORIES = {
     "knowledge", "tool_routed", "misconception_correction",
@@ -96,6 +107,18 @@ def normalize_metadata(qa: dict) -> dict:
         qa["is_tool_routed"] = True
     if qa.get("is_tool_routed") and not qa.get("tool_routing"):
         qa["is_tool_routed"] = False
+
+    # product_comparison 跨字段一致性：有 category 但缺 product_a/product_b 时降级
+    if qa.get("qa_category") == "product_comparison":
+        if not qa.get("product_a") or not qa.get("product_b"):
+            logger.warning(
+                f"qa_id={qa.get('id', '?')} 声明为 product_comparison 但缺少 product_a/product_b，降级为 knowledge"
+            )
+            qa["qa_category"] = "knowledge"
+
+    # tool_routed 跨字段一致性：is_tool_routed=True 但 qa_category 不匹配时修正
+    if qa.get("is_tool_routed") and qa.get("qa_category") not in ("tool_routed",):
+        qa["qa_category"] = "tool_routed"
 
     # 默认值补全
     defaults = [
@@ -455,6 +478,86 @@ def _dedup_embedding_incremental(
 
     logger.info(f"增量去重(embedding): {len(unique)} 唯一, {len(duplicates)} 重复")
     return unique, duplicates
+
+
+def run_seed_dedup_incremental_with_cache(
+    new_qa: list[dict],
+    cached_matrix,
+    threshold: float = 0.92,
+) -> tuple[list[dict], list[dict], object]:
+    """
+    增量去重（使用缓存 embedding 矩阵）。
+    cached_matrix: np.ndarray (N, dim) 或 None（首次运行）。
+    返回 (unique_qa, dup_qa, new_unique_embeddings)。
+    new_unique_embeddings 是新增唯一种子的 embedding，供调用方追加到缓存。
+    """
+    if not new_qa:
+        return [], [], None
+    try:
+        return _dedup_embedding_cached(new_qa, cached_matrix, threshold)
+    except ImportError:
+        logger.warning("sentence-transformers 不可用，使用 n-gram 增量去重（无 embedding 缓存）")
+        unique, dups = _dedup_ngram_incremental(new_qa, [], threshold=0.7)
+        return unique, dups, None
+
+
+def _dedup_embedding_cached(
+    new_qa: list[dict],
+    cached_matrix,
+    threshold: float,
+) -> tuple[list[dict], list[dict], object]:
+    """只对新种子编码，与缓存矩阵比对，避免重新编码历史数据。"""
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+    from concurrent.futures import ThreadPoolExecutor
+
+    model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+    new_questions = [qa.get("question", "") for qa in new_qa]
+
+    logger.info(f"增量去重(cached): 编码 {len(new_questions)} 条新问题向量...")
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        new_embs = executor.submit(
+            model.encode, new_questions, normalize_embeddings=True, show_progress_bar=False
+        ).result()
+
+    N_cached = len(cached_matrix) if cached_matrix is not None else 0
+    dim = new_embs.shape[1]
+    max_unique = N_cached + len(new_qa)
+    unique_matrix = np.zeros((max_unique, dim), dtype=np.float32)
+
+    if cached_matrix is not None and N_cached > 0:
+        unique_matrix[:N_cached] = cached_matrix
+    unique_count = N_cached
+
+    unique, duplicates, new_unique_embs = [], [], []
+    LOG_EVERY = max(500, len(new_qa) // 10)
+
+    for i, (qa, emb) in enumerate(zip(new_qa, new_embs)):
+        if i > 0 and i % LOG_EVERY == 0:
+            logger.info(f"增量去重进度: {i}/{len(new_qa)} ({i/len(new_qa):.0%})")
+        if unique_count == 0:
+            unique.append(qa)
+            unique_matrix[0] = emb
+            new_unique_embs.append(emb)
+            unique_count = 1
+            continue
+        sims = unique_matrix[:unique_count] @ emb
+        if float(sims.max()) > threshold:
+            qa["_qc_issues"] = qa.get("_qc_issues", []) + ["语义重复"]
+            duplicates.append(qa)
+        else:
+            unique.append(qa)
+            unique_matrix[unique_count] = emb
+            new_unique_embs.append(emb)
+            unique_count += 1
+
+    result_embs = (
+        np.array(new_unique_embs, dtype=np.float32)
+        if new_unique_embs
+        else np.zeros((0, dim), dtype=np.float32)
+    )
+    logger.info(f"增量去重(cached): {len(unique)} 唯一, {len(duplicates)} 重复")
+    return unique, duplicates, result_embs
 
 
 # ============================================================
@@ -911,7 +1014,15 @@ def _is_high_risk_regulatory_qa(qa: dict, anchor_issues: list[str]) -> bool:
 async def _llm_verify_one(qa: dict, chunks_index: dict[str, str], client, template: str, sem: asyncio.Semaphore) -> dict:
     """对单条高风险 Q&A 做 LLM 二级校验"""
     chunk_id = qa.get("source_chunk_id", "")
-    source_text = chunks_index.get(chunk_id, "（来源文档内容不可用）")
+    source_text = chunks_index.get(chunk_id, "")
+    # If source doc is unavailable, flag for manual review instead of auto-passing
+    if not source_text:
+        return {
+            "qa_id": qa.get("id", ""),
+            "verdict": "flag",
+            "issues": ["来源文档不可用，无法核验答案准确性，需人工复核"],
+            "hallucination_risk": "unknown",
+        }
     async with sem:
         prompt = template.format(
             source_text=source_text[:2000],

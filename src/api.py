@@ -284,6 +284,8 @@ async def list_qa(
     difficulty: str = "",
     question_type: str = "",
     generation_method: str = "",
+    source_doc: str = "",
+    sort: str = "newest",
     search: str = "",
 ):
     from src.data_reader import read_jsonl_paged
@@ -298,8 +300,10 @@ async def list_qa(
         "difficulty":        difficulty,
         "question_type":     question_type,
         "generation_method": generation_method,
+        "source_doc":        source_doc,
     }.items() if v}
-    return await asyncio.to_thread(read_jsonl_paged, filepath, page, size, filters, search)
+    newest_first = sort == "newest"
+    return await asyncio.to_thread(read_jsonl_paged, filepath, page, size, filters, search, newest_first)
 
 
 @router_data.get("/reports/overview")
@@ -384,11 +388,158 @@ async def qa_ask(question: str):
     return await asyncio.to_thread(_search)
 
 
+# ─── Logs router ─────────────────────────────────────────────────────────────
+
+router_logs = APIRouter(prefix="/api/logs", tags=["logs"])
+
+_LOGS_FILE = BASE_DIR / "data" / "llm_logs" / "llm_calls.jsonl"
+
+
+@router_logs.get("/stats")
+async def logs_stats():
+    def _calc():
+        if not _LOGS_FILE.exists():
+            return {"total": 0, "success": 0, "failed": 0,
+                    "total_input_tokens": 0, "total_output_tokens": 0,
+                    "total_cost_yuan": 0.0, "stages": {}, "models": {}}
+        total = success = failed = 0
+        total_in = total_out = 0
+        total_cost = 0.0
+        stages: dict[str, int] = {}
+        models: dict[str, int] = {}
+        with open(_LOGS_FILE, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                r = json.loads(line)
+                total += 1
+                if r.get("status") == "success":
+                    success += 1
+                else:
+                    failed += 1
+                total_in   += r.get("input_tokens", 0)
+                total_out  += r.get("output_tokens", 0)
+                total_cost += r.get("cost_yuan", 0.0)
+                s = r.get("stage", "unknown")
+                stages[s] = stages.get(s, 0) + 1
+                m = r.get("model", "unknown")
+                models[m] = models.get(m, 0) + 1
+        return {
+            "total": total, "success": success, "failed": failed,
+            "total_input_tokens": total_in, "total_output_tokens": total_out,
+            "total_cost_yuan": round(total_cost, 4),
+            "stages": stages, "models": models,
+        }
+    return await asyncio.to_thread(_calc)
+
+
+@router_logs.get("")
+async def list_logs(
+    page: int = 1,
+    size: int = 20,
+    stage: str = "",
+    model: str = "",
+    status: str = "",
+    search: str = "",
+    start_time: str = "",
+    end_time: str = "",
+):
+    def _load():
+        if not _LOGS_FILE.exists():
+            return {"items": [], "total": 0, "page": 1, "size": size, "pages": 1}
+        kw = search.strip().lower()
+        # Normalize to comparable ISO prefix (e.g. "2024-01-01T00:00:00")
+        ts_start = start_time.strip()
+        ts_end   = end_time.strip()
+        # Append time suffix when only date is given so string comparison works
+        if ts_start and len(ts_start) == 10:
+            ts_start += "T00:00:00"
+        if ts_end and len(ts_end) == 10:
+            ts_end += "T23:59:59"
+        matched = []
+        with open(_LOGS_FILE, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                r = json.loads(line)
+                if stage  and r.get("stage", "")  != stage:
+                    continue
+                if model  and r.get("model", "")  != model:
+                    continue
+                if status and r.get("status", "") != status:
+                    continue
+                ts = r.get("timestamp", "")
+                if ts_start and ts < ts_start:
+                    continue
+                if ts_end and ts > ts_end:
+                    continue
+                if kw:
+                    haystack = (
+                        r.get("prompt", "") + " " + r.get("response", "")
+                    ).lower()
+                    if kw not in haystack:
+                        continue
+                # Strip full prompt/response for list; include previews only
+                matched.append({
+                    "call_id":       r.get("call_id", ""),
+                    "timestamp":     r.get("timestamp", ""),
+                    "stage":         r.get("stage", ""),
+                    "provider":      r.get("provider", ""),
+                    "model":         r.get("model", ""),
+                    "status":        r.get("status", ""),
+                    "input_tokens":  r.get("input_tokens", 0),
+                    "output_tokens": r.get("output_tokens", 0),
+                    "cost_yuan":     r.get("cost_yuan", 0.0),
+                    "duration_ms":   r.get("duration_ms", 0),
+                    "prompt_preview":  r.get("prompt", "")[:300],
+                    "response_preview": r.get("response", "")[:300],
+                    "error":         r.get("error", ""),
+                    # Full content for expanded view (kept here so no second request needed)
+                    "prompt":   r.get("prompt", ""),
+                    "response": r.get("response", ""),
+                    "system":   r.get("system", ""),
+                })
+        # Newest first
+        matched.reverse()
+        total = len(matched)
+        size_ = min(max(size, 1), 100)
+        skip  = (page - 1) * size_
+        return {
+            "items": matched[skip:skip + size_],
+            "total": total,
+            "page":  page,
+            "size":  size_,
+            "pages": max(1, (total + size_ - 1) // size_),
+        }
+    return await asyncio.to_thread(_load)
+
+
+@router_logs.get("/filters")
+async def logs_filter_options():
+    def _load():
+        if not _LOGS_FILE.exists():
+            return {"stages": [], "models": []}
+        stages: set[str] = set()
+        models: set[str] = set()
+        with open(_LOGS_FILE, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                r = json.loads(line)
+                if r.get("stage"):
+                    stages.add(r["stage"])
+                if r.get("model"):
+                    models.add(r["model"])
+        return {"stages": sorted(stages), "models": sorted(models)}
+    return await asyncio.to_thread(_load)
+
+
 # ─── Register routers & mount frontend ───────────────────────────────────────
 
 app.include_router(router_docs)
 app.include_router(router_pipeline)
 app.include_router(router_data)
+app.include_router(router_logs)
 
 frontend_dir = BASE_DIR / "frontend"
 frontend_dir.mkdir(exist_ok=True)

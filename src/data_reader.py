@@ -17,9 +17,17 @@ def _iter_jsonl(filepath: Path):
                 continue
 
 
+_SUBSTRING_FIELDS = {"source_doc"}
+
 def _matches(item: dict, filters: dict, search: str) -> bool:
     for key, value in filters.items():
-        if value and item.get(key) != value:
+        if not value:
+            continue
+        field_val = item.get(key, "") or ""
+        if key in _SUBSTRING_FIELDS:
+            if value.lower() not in field_val.lower():
+                return False
+        elif field_val != value:
             return False
     if search:
         haystack = (item.get("question", "") + " " + item.get("text", "")).lower()
@@ -34,24 +42,22 @@ def read_jsonl_paged(
     size: int = 20,
     filters: dict | None = None,
     search: str = "",
+    newest_first: bool = False,
 ) -> dict[str, Any]:
     filters = filters or {}
-    size    = min(max(size, 1), 100)
-    skip    = (page - 1) * size
-    items: list[dict] = []
-    total     = 0
-    collected = 0
+    size = min(max(size, 1), 100)
 
-    for item in _iter_jsonl(filepath):
-        if not _matches(item, filters, search):
-            continue
-        total += 1
-        if collected < skip:
-            collected += 1
-            continue
-        if len(items) < size:
-            items.append(item)
-            collected += 1
+    matched = [
+        item for item in _iter_jsonl(filepath)
+        if _matches(item, filters, search)
+    ]
+
+    if newest_first:
+        matched.reverse()
+
+    total = len(matched)
+    skip  = (page - 1) * size
+    items = matched[skip: skip + size]
 
     return {
         "items": items,
